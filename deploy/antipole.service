@@ -1,0 +1,20 @@
+[Unit]
+Description=antipoleBGP main service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 要动 ip/wg/nft/路由表，root 跑（512MB 小机不用折腾 capabilities）
+User=root
+WorkingDirectory=/root/antipole
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m app.main /etc/antipole/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+MemoryMax=400M
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
