@@ -1,6 +1,6 @@
 # antipoleBGP 出口调度管理系统
 
-**软件版本：V1.1**　　**软件简称：antipoleBGP**
+**软件版本：V1.1**　　**antipoleBGP-PROJECT**
 
 antipoleBGP 出口调度管理系统是一套基于 BGP 的 IPv6 出口调度与安全代理管理软件。系统在服务器上广播一个 /48（支持 /32~/64 范围）前缀，为每个注册用户分配独立的 /128 IPv6 出口地址，并按互联网服务商（ISP）租约规律随机轮换出口；同时集成 VLESS Reality 代理与 WARP IPv4 出口，支持 WireGuard 全隧道与代理协议两种接入方式。
 
@@ -95,7 +95,6 @@ tools/
 copyright/         生成的源程序鉴别材料（前30页/后30页）
 config.yaml       配置文件模板
 install.sh        自适应安装脚本
-test_smoke.py     离线自检（全 mock，不操作真实系统）
 ```
 
 ---
