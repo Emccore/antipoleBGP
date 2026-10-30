@@ -7,6 +7,8 @@ set -euo pipefail
 MNG_PORT=9090        # 管理 API（JSON + metrics）
 WG_PORT=51820        # WireGuard
 XRAY_PORT=80         # VLESS Reality 入站（HTTP 端口 + SNI 伪装）
+TUNNEL_PORT=18281    # 隧道控制端口（tunnel.enabled 时）
+REG_PORT=18290       # 自助注册（server.register_enabled 时）
 # TROJAN_PORT=2054   # 开了 trojan 再放行
 
 nft add table inet antipole-fw 2>/dev/null || true
@@ -20,10 +22,12 @@ if command -v ufw >/dev/null 2>&1 && grep -q 'DEFAULT_FORWARD_POLICY="DROP"' /et
     echo "已把 ufw 默认转发策略改为 ACCEPT（WG/NAT64 转发必需）"
 fi
 
-# 管理 API / WG / VLESS 端口放行
+# 管理 API / WG / VLESS / 隧道控制 / 自助注册 端口放行
 nft add rule inet antipole-fw input tcp dport $MNG_PORT accept
 nft add rule inet antipole-fw input udp dport $WG_PORT accept
 nft add rule inet antipole-fw input tcp dport $XRAY_PORT accept
+nft add rule inet antipole-fw input tcp dport $TUNNEL_PORT accept
+nft add rule inet antipole-fw input tcp dport $REG_PORT accept
 
 # 只限管理 API 来源的写法（把上面那行 tcp dport $MNG_PORT 换掉）：
 #   ADMIN_SOURCES="1.2.3.4,5.6.7.8"

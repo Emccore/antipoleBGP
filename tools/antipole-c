@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# antipoleBGP 隧道客户端管理脚本（Linux）
+#
+# 每个连接一份配置文件，交给 systemd 常驻托管（无 systemd 时退回 nohup 后台）。
+#
+#   antipole-c install                    安装/更新客户端与 systemd 模板
+#   antipole-c add <名称> --server <地址:端口> --token <令牌> [--map <端口>]...
+#                       [--cert-domain <域名>] [--cert-renew-days <天数>]
+#   antipole-c del <名称>                 删除连接（含配置与证书）
+#   antipole-c list                       列出全部连接与运行状态
+#   antipole-c start|stop|restart <名称>
+#   antipole-c status <名称>              查看状态摘要（含证书剩余天数）
+#   antipole-c log <名称> [行数]          查看最近日志
+#   antipole-c cert <名称> <域名>         一键申请 HTTPS 证书并开启自动续期
+#   antipole-c renew <名称>               立即检查证书，临近过期则触发重签
+#   antipole-c doctor                     环境自检
+#
+set -uo pipefail
+
+CONF_DIR=${ANTIPOLE_C_DIR:-/etc/antipole-c}
+LIB_DIR=/usr/local/lib/antipole-c
+CLIENT="$LIB_DIR/antipole-tunnel.py"
+UNIT=/etc/systemd/system/antipole-c@.service
+PY=$(command -v python3 || command -v python)
+
+c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_off=$'\033[0m'
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$c_grn" "$c_off" "$*"; }
+warn() { printf '%s!%s %s\n' "$c_ylw" "$c_off" "$*"; }
+die()  { printf '%s✗%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
+
+need_root() { [ "$(id -u)" = "0" ] || die "需要 root 权限（sudo antipole-c ...）"; }
+need_py()   { [ -n "$PY" ] || die "未找到 python3，请先安装：apt install python3"; }
+
+unit_active() { systemctl is-active --quiet "antipole-c@$1" 2>/dev/null; }
+has_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
+
+conf_path() { echo "$CONF_DIR/$1.ini"; }
+
+# 从连接配置读取单项（缺省取第三个参数）
+conf_get() {
+    local v; v=$(sed -n "s/^$2 *= *//p" "$(conf_path "$1")" 2>/dev/null | head -1)
+    if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "${3:-}"; fi
+}
+cert_dir_of()     { conf_get "$1" cert_dir "$CONF_DIR/$1"; }
+cert_renew_days() { conf_get "$1" cert_renew_days 30; }
+
+# 证书有效期摘要：未配置 / 未签发 / 剩余 N 天
+cert_summary() {
+    local dir rc out
+    dir=$(cert_dir_of "$1")
+    [ -d "$dir" ] || { echo "未配置"; return; }
+    out=$("$PY" "$CLIENT" --cert-status --cert-dir "$dir" \
+          --cert-renew-days "$(cert_renew_days "$1")" 2>&1)
+    rc=$?
+    case "$rc" in
+        0|2) printf '%s\n' "$out" | sed -n 's/^证书剩余 /剩余 /p' ;;
+        *)   echo "未签发" ;;
+    esac
+}
+
+# 把证书自动续期参数写入连接配置（供常驻客户端开机生效）
+set_cert_conf() {
+    local name=$1 domain=$2 days=$3 conf; conf=$(conf_path "$name")
+    sed -i '/^cert_domain *=/d;/^cert_renew_days *=/d;/^cert_dir *=/d' "$conf"
+    {
+        echo "cert_domain     = $domain"
+        echo "cert_renew_days = $days"
+        echo "cert_dir        = $CONF_DIR/$name"
+    } >> "$conf"
+    chmod 600 "$conf"
+}
+
+# ---------- install ----------
+
+cmd_install() {
+    need_root; need_py
+    mkdir -p "$LIB_DIR"
+    local src=${1:-}
+    if [ -z "$src" ]; then
+        for cand in "$(dirname "$0")/antipole-tunnel.py" /root/antipole/tools/antipole-tunnel.py \
+                    ./antipole-tunnel.py /usr/local/bin/antipole-tunnel.py; do
+            [ -f "$cand" ] && { src=$cand; break; }
+        done
+    fi
+    [ -n "$src" ] && [ -f "$src" ] || die "未找到客户端脚本，请指定：antipole-c install /路径/antipole-tunnel.py"
+    install -m 0755 "$src" "$CLIENT"
+    ok "客户端已安装 $CLIENT"
+
+    if has_systemd; then
+        cat > "$UNIT" <<EOF
+[Unit]
+Description=antipoleBGP tunnel client (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$PY $CLIENT --config $CONF_DIR/%i.ini
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        ok "systemd 模板已写入 $UNIT"
+    else
+        warn "未检测到 systemd，将使用 nohup 后台方式"
+    fi
+    mkdir -p "$CONF_DIR" && chmod 700 "$CONF_DIR"
+    ok "安装完成"
+}
+
+# ---------- add / del ----------
+
+cmd_add() {
+    need_root
+    local name=${1:-}; shift || true
+    [ -n "$name" ] || die "用法：antipole-c add <名称> --server <地址:端口> --token <令牌> --map <端口>"
+    [ "$name" = "${name//[^A-Za-z0-9._-]/}" ] || die "名称只允许字母数字与 . _ -"
+    local server="" token="" retry=5 ping=15 stats=10
+    local cert_domain="" cert_renew_days=30
+    local -a maps=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --server) server=${2:-}; shift 2 ;;
+            --token)  token=${2:-};  shift 2 ;;
+            --map)    maps+=("${2:-}"); shift 2 ;;
+            --retry)  retry=${2:-5}; shift 2 ;;
+            --ping)   ping=${2:-15}; shift 2 ;;
+            --stats)  stats=${2:-10}; shift 2 ;;
+            --cert-domain)      cert_domain=${2:-}; shift 2 ;;
+            --cert-renew-days)  cert_renew_days=${2:-30}; shift 2 ;;
+            *) die "未知参数：$1" ;;
+        esac
+    done
+    [ -n "$server" ] || die "缺少 --server（如 [2600:1:2:ff00::1]:18281）"
+    [ -n "$token" ]  || die "缺少 --token"
+    [ ${#maps[@]} -gt 0 ] || die "至少需要一个 --map 本地端口"
+
+    mkdir -p "$CONF_DIR" "$CONF_DIR/$name" && chmod 700 "$CONF_DIR" "$CONF_DIR/$name"
+    local conf; conf=$(conf_path "$name")
+    {
+        echo "[client]"
+        echo "server = $server"
+        echo "token  = $token"
+        for m in "${maps[@]}"; do echo "map    = $m"; done
+        echo "retry  = $retry"
+        echo "ping   = $ping"
+        echo "stats  = $stats"
+        if [ -n "$cert_domain" ]; then
+            echo "cert_domain     = $cert_domain"
+            echo "cert_renew_days = $cert_renew_days"
+            echo "cert_dir        = $CONF_DIR/$name"
+        fi
+    } > "$conf"
+    chmod 600 "$conf"
+    ok "配置已写入 $conf"
+    [ -n "$cert_domain" ] && ok "已开启证书自动续期 $cert_domain（剩余不足 $cert_renew_days 天自动重签）"
+
+    if has_systemd; then
+        systemctl enable --now "antipole-c@$name" >/dev/null 2>&1 \
+            || die "启动失败，查看：antipole-c log $name"
+        ok "服务已启动 antipole-c@$name（开机自启）"
+    else
+        nohup "$PY" "$CLIENT" --config "$conf" >> "$CONF_DIR/$name/client.log" 2>&1 &
+        echo $! > "$CONF_DIR/$name/pid"
+        ok "已后台启动，日志：$CONF_DIR/$name/client.log"
+    fi
+    cmd_status "$name"
+}
+
+cmd_del() {
+    need_root
+    local name=${1:-}; [ -n "$name" ] || die "用法：antipole-c del <名称>"
+    cmd_stop "$name" >/dev/null 2>&1
+    if has_systemd; then
+        systemctl disable "antipole-c@$name" >/dev/null 2>&1
+    fi
+    rm -rf "$CONF_DIR/$name.ini" "$CONF_DIR/$name"
+    ok "已删除连接 $name"
+}
+
+# ---------- start / stop / status / log ----------
+
+cmd_start() {
+    need_root
+    local name=${1:-}; [ -n "$name" ] || die "用法：antipole-c start <名称>"
+    [ -f "$(conf_path "$name")" ] || die "连接不存在：$name"
+    if has_systemd; then
+        systemctl start "antipole-c@$name" && ok "已启动 $name"
+    else
+        nohup "$PY" "$CLIENT" --config "$(conf_path "$name")" \
+            >> "$CONF_DIR/$name/client.log" 2>&1 &
+        echo $! > "$CONF_DIR/$name/pid"; ok "已启动 $name (pid $(cat "$CONF_DIR/$name/pid"))"
+    fi
+}
+
+cmd_stop() {
+    need_root
+    local name=${1:-}; [ -n "$name" ] || die "用法：antipole-c stop <名称>"
+    if has_systemd; then
+        systemctl stop "antipole-c@$name" 2>/dev/null && ok "已停止 $name"
+    else
+        [ -f "$CONF_DIR/$name/pid" ] && kill "$(cat "$CONF_DIR/$name/pid")" 2>/dev/null \
+            && rm -f "$CONF_DIR/$name/pid" && ok "已停止 $name"
+    fi
+}
+
+cmd_restart() { cmd_stop "$1"; sleep 1; cmd_start "$1"; }
+
+cmd_list() {
+    [ -d "$CONF_DIR" ] || { warn "还没有任何连接，先执行 antipole-c add ..."; return 0; }
+    printf '%-14s %-34s %-10s %s\n' 名称 接入地址 状态 映射
+    local found=0
+    for conf in "$CONF_DIR"/*.ini; do
+        [ -f "$conf" ] || continue
+        found=1
+        local name; name=$(basename "$conf" .ini)
+        local server maps state
+        server=$(sed -n 's/^server *= *//p' "$conf" | head -1)
+        maps=$(sed -n 's/^map *= *//p' "$conf" | tr '\n' ',' | sed 's/,$//')
+        if has_systemd; then
+            unit_active "$name" && state=运行中 || state=已停止
+        else
+            [ -f "$CONF_DIR/$name/pid" ] && kill -0 "$(cat "$CONF_DIR/$name/pid")" 2>/dev/null \
+                && state=运行中 || state=已停止
+        fi
+        printf '%-14s %-34s %-10s %s\n' "$name" "$server" "$state" "$maps"
+    done
+    [ "$found" = 1 ] || warn "还没有任何连接，先执行 antipole-c add ..."
+}
+
+cmd_status() {
+    local name=${1:-}; [ -n "$name" ] || die "用法：antipole-c status <名称>"
+    local conf; conf=$(conf_path "$name")
+    [ -f "$conf" ] || die "连接不存在：$name"
+    say "连接     : $name"
+    say "配置文件 : $conf"
+    say "接入地址 : $(sed -n 's/^server *= *//p' "$conf" | head -1)"
+    say "映射端口 : $(sed -n 's/^map *= *//p' "$conf" | tr '\n' ' ')"
+    if has_systemd; then
+        say "服务状态 : $(systemctl is-active "antipole-c@$name" 2>/dev/null)"
+        systemctl show -p MainPID --value "antipole-c@$name" 2>/dev/null \
+            | awk '{ if ($1 != "0") print "进程号   : " $1 }'
+    fi
+    [ -f "$CONF_DIR/$name/tls.crt" ] && say "证书     : $CONF_DIR/$name/tls.crt"
+    say "证书有效期: $(cert_summary "$name")"
+    local last
+    last=$(cmd_log "$name" 4 2>/dev/null | tail -4)
+    [ -n "$last" ] && { say "最近日志 :"; printf '%s\n' "$last" | sed 's/^/           /'; }
+    return 0
+}
+
+cmd_log() {
+    local name=${1:-}; local lines=${2:-40}
+    [ -n "$name" ] || die "用法：antipole-c log <名称> [行数]"
+    if has_systemd; then
+        journalctl -u "antipole-c@$name" -n "$lines" --no-pager 2>/dev/null
+    else
+        tail -n "$lines" "$CONF_DIR/$name/client.log" 2>/dev/null
+    fi
+}
+
+# ---------- cert ----------
+
+cmd_cert() {
+    need_root
+    local name=${1:-} domain=${2:-}
+    [ -n "$name" ] && [ -n "$domain" ] || die "用法：antipole-c cert <名称> <域名>"
+    local conf; conf=$(conf_path "$name")
+    [ -f "$conf" ] || die "连接不存在：$name"
+    local server token was_running=0
+    server=$(conf_get "$name" server)
+    token=$(conf_get "$name" token)
+    say "提示：请先把 $domain 的 AAAA 记录指向本账号的隧道静态地址（antipole-c status 中可见）"
+
+    # 同一账号只允许一条会话，申请期间先让常驻服务退出，避免握手被判重复
+    if has_systemd && unit_active "$name"; then
+        was_running=1
+        cmd_stop "$name" >/dev/null 2>&1
+    fi
+    local rc=0
+    "$PY" "$CLIENT" --server "$server" --token "$token" \
+        --cert "$domain" --cert-dir "$CONF_DIR/$name" || rc=1
+    if [ "$rc" != 0 ]; then
+        [ "$was_running" = 1 ] && cmd_start "$name" >/dev/null 2>&1
+        die "申请失败（证书目录 $CONF_DIR/$name 未更新）"
+    fi
+    ok "证书已写入 $CONF_DIR/$name/tls.crt 与 tls.key（私钥权限 600）"
+
+    set_cert_conf "$name" "$domain" 30
+    ok "已开启自动续期：剩余不足 30 天时由常驻客户端自动重签"
+    [ "$was_running" = 1 ] && cmd_start "$name" >/dev/null 2>&1 && ok "服务已恢复运行"
+    cmd_status "$name"
+}
+
+cmd_renew() {
+    need_root
+    local name=${1:-}; [ -n "$name" ] || die "用法：antipole-c renew <名称>"
+    local conf; conf=$(conf_path "$name")
+    [ -f "$conf" ] || die "连接不存在：$name"
+    local domain; domain=$(conf_get "$name" cert_domain)
+    [ -n "$domain" ] || die "该连接未开启自动续期，请执行：antipole-c cert $name <域名>"
+
+    local dir rc
+    dir=$(cert_dir_of "$name")
+    "$PY" "$CLIENT" --cert-status --cert-dir "$dir" \
+        --cert-renew-days "$(cert_renew_days "$name")" >/dev/null 2>&1
+    rc=$?
+    case "$rc" in
+        0) ok "证书仍在有效期内（$(cert_summary "$name")），无需续期"; return 0 ;;
+        1) die "本地还没有证书，请先执行：antipole-c cert $name $domain" ;;
+    esac
+    # 重启即触发常驻客户端立即检查并重签（客户端启动时先检查再进入 12 小时轮询）
+    cmd_restart "$name"
+    ok "已触发证书续期，稍后查看：antipole-c log $name"
+}
+
+# ---------- doctor ----------
+
+cmd_doctor() {
+    say "客户端    : $([ -f "$CLIENT" ] && echo "$CLIENT" || echo '未安装')"
+    say "Python    : ${PY:-未找到}"
+    say "systemd   : $(has_systemd && echo 可用 || echo '不可用（退回 nohup）')"
+    say "配置目录  : $CONF_DIR $([ -d "$CONF_DIR" ] && echo 存在 || echo 不存在)"
+    if [ -n "$PY" ] && [ -f "$CLIENT" ]; then
+        "$PY" "$CLIENT" --version >/dev/null 2>&1 && ok "客户端可执行" || die "客户端无法执行"
+    fi
+    local n=0
+    for conf in "$CONF_DIR"/*.ini; do [ -f "$conf" ] && n=$((n+1)); done
+    ok "共 $n 个连接配置"
+}
+
+usage() {
+    sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+    local cmd=${1:-help}; shift || true
+    case "$cmd" in
+        install) cmd_install "$@" ;;
+        add)     cmd_add "$@" ;;
+        del|rm)  cmd_del "$@" ;;
+        start)   cmd_start "$@" ;;
+        stop)    cmd_stop "$@" ;;
+        restart) cmd_restart "$@" ;;
+        list|ls) cmd_list ;;
+        status)  cmd_status "$@" ;;
+        log|logs) cmd_log "$@" ;;
+        cert)    cmd_cert "$@" ;;
+        renew)   cmd_renew "$@" ;;
+        doctor)  cmd_doctor ;;
+        help|-h|--help) usage ;;
+        *) die "未知命令：$cmd（antipole-c help 查看用法）" ;;
+    esac
+}
+
+main "$@"

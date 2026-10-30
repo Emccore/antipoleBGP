@@ -1,0 +1,163 @@
+# antipoleBGP 配置示例：复制为 config.yaml 后按注释修改
+#   cp config.example.yaml config.yaml && chmod 600 config.yaml
+server:
+  host: "::"                     # 管理 API 监听（:: = 双栈；建议配合 admin_allow 限制来源）
+  port: 9090
+  admin_token: "change-me"       # 部署后必须改成随机串（管理 API 认证用）
+  view_token: ""
+  admin_allow: ["127.0.0.1"]     # 10/13 运行日志
+  register_enabled: false
+  register_port: 18290
+
+network:
+  prefix: "2001:db8:abcd::/48"   # 已 BGP 广播的前缀（换成你自己的，建议 /48）
+  wg_iface: "wg0"
+  wg_port: 51820
+  wg_addr: "fd00:1::1/64"
+  wg_v4_addr: "10.7.0.1/24"
+  internal_net: "fd00:1::/64"
+  route_table_base: 100
+  public_ip: ""                  # 服务器公网 IPv6（留空自动探测）
+  warp_mark: 4096
+  warp_table: 51820
+  user_mark_base: 1073741824
+  tc_enabled: true
+  tc_wan: ""
+  ranges: {}                     # 命名网段；留空自动派生（主段 + tunnel 段）
+  tunnel_range: ""               # 隧道业务网段；留空自动取主前缀最后一个 /56
+
+tunnel:
+  enabled: true
+  listen: ""                     # 隧道控制面：本机业务地址自动收敛（接入 fe00::1）
+  port: 18281
+  range: "tunnel"
+  bind: ""
+  sni: ""
+  cert: ""
+  key: ""
+  max_conns_per_user: 0          # 0 = 不限
+  conn_rate_per_user: 0          # 0 = 不限
+  frame_max: 1048576
+  bulk_pause_ms: 4
+  relay_bin: bin/antipole-relay
+  relay_sock: /run/antipole-relay.sock
+  relay_port: 18282
+  relay_stat_file: logs/relay-stats.log
+  idle_timeout: 300
+
+rotation:
+  enabled: false
+  min_interval: 1800
+  max_interval: 7200
+  start_seq: 1
+
+xray:
+  enabled: true
+  bin: "/usr/local/bin/xray"
+  conf: "/etc/antipole/xray.json"
+  listen: ""                 # VLESS 入站固定地址（留空 = 本机主地址；建议填 BGP 前缀内的固定 /128）
+  announce: ""               # 分享链接展示域名（AAAA 指向 listen 地址；留空用 listen 地址）
+  port: 443                 # Reality 伪装端口：与 dest 真实站点一致（apple.com 的 443）；
+                            # 在 80 上跑 TLS 是明显特征，80 留给 mc 伪装站点（main.py）
+  api_port: 10085
+  sni_dest: "www.apple.com"
+  dest_ip: "2600:1402:b800:d8a::1aca"
+  ufp: "chrome"
+  fallback: "127.0.0.1:50080"
+  sensitive_domains:
+  - google.com
+  - googleapis.com
+  - gstatic.com
+  - googleusercontent.com
+  - ggpht.com
+  - youtube.com
+  - youtu.be
+  - google-analytics.com
+  - googlesyndication.com
+  - google.com.hk
+  - google.com.tw
+  - microsoft.com
+  - microsoftonline.com
+  - live.com
+  - office.com
+  - windows.com
+  - msn.com
+  - outlook.com
+  - onedrive.com
+  - bing.com
+  - apple.com
+  - icloud.com
+  - me.com
+  - facebook.com
+  - fbsbx.com
+  - fb.com
+  - instagram.com
+  - whatsapp.com
+  - fbcdn.net
+  - x.com
+  - twitter.com
+  - t.co
+  - twimg.com
+  - amazon.com
+  - paypal.com
+  - paypalobjects.com
+  - telegram.org
+  - t.me
+  - openai.com
+  - chatgpt.com
+  - oaistatic.com
+  - oaiusercontent.com
+  - anthropic.com
+  - claude.ai
+  - github.com
+  - githubusercontent.com
+  - linkedin.com
+  - spotify.com
+  - netflix.com
+  - tiktok.com
+  - tiktokcdn.com
+  - reddit.com
+  - redditmedia.com
+  - discord.com
+  - discordapp.com
+  - snapchat.com
+  - twitch.tv
+  - cloudflare.com
+  - cloudflareinsights.com
+  trojan:
+    enabled: false
+    port: 2054
+    cert: "/etc/antipole/tls.crt"
+    key: "/etc/antipole/tls.key"
+
+warp:
+  enabled: true
+  wgcf: "/usr/local/bin/wgcf"
+  iface: "wg-warp"
+  profile: "/etc/antipole/warp-profile.conf"
+  endpoints: []
+
+dns64:
+  enabled: true
+  iface: "nat64"
+  prefix: "64:ff9b::/96"
+  v4_net: "10.44.0.0/16"
+  dns_v6: "fd00:1::1"
+  forward: ["2606:4700:4700::1111", "2001:4860:4860::8888"]
+
+abuse:
+  login_fails: 5
+  login_ban_s: 900
+  register_per_hour: 3
+  default_quota_mb: 0
+  default_mbps: 0
+  quota_check_s: 10
+  quota_warn_pct: 90
+
+alerts:
+  webhook: ""
+  cert_days: 14
+
+db:
+  path: "/etc/antipole/data.sqlite3"
+  keys_dir: "/etc/antipole/keys"

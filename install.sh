@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  antipoleBGP 出口调度管理系统 一键安装脚本（V1.1）
+#  antipoleBGP 出口调度管理系统 一键安装脚本（V2.0）
 #
 #  支持的发行版与包管理器：
 #    - Debian / Ubuntu                  -> apt
@@ -23,7 +23,7 @@
 # ============================================================
 set -euo pipefail
 
-INST_VERSION="V1.1"
+INST_VERSION="V3.20"
 APP_DIR=${APP_DIR:-/root/antipole}
 CONF_DIR=${CONF_DIR:-/etc/antipole}
 APT_UPDATED=0
@@ -242,6 +242,10 @@ install_py_deps() {
         || die "Python 依赖安装失败（aiohttp/pyyaml），请检查网络与 pip 源"
     python3 -c "import aiohttp, yaml" 2>/dev/null \
         || die "Python 依赖导入校验失败"
+    # uvloop 是可选加速：装不上就用标准事件循环，不影响功能
+    python3 -m pip install --break-system-packages uvloop >/dev/null 2>&1 \
+        || python3 -m pip install uvloop >/dev/null 2>&1 \
+        || echo "    uvloop 未安装（将使用标准事件循环，不影响功能）"
 }
 
 # ---------- 6. 生成配置 ----------
@@ -267,6 +271,8 @@ server:
   admin_token: "$TOKEN"
   view_token: ""
   $ALLOW_LINE
+  register_enabled: false
+  register_port: 18290
 network:
   prefix: "$PREFIX"
   wg_iface: "wg0"
@@ -280,6 +286,11 @@ network:
   warp_table: 51820
   tc_enabled: true
   tc_wan: ""
+  ranges: {}
+  tunnel_range: ""
+tunnel:
+  enabled: false
+  port: 18281
 rotation:
   min_interval: 1800
   max_interval: 7200
@@ -339,10 +350,31 @@ EOF
 setup_service() {
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
     sysctl -w net.ipv4.conf.all.forwarding=1 >/dev/null 2>&1 || true
+    # 内核/网络调优（幂等）：转发吞吐与海量连接的关键参数。
+    #   队列：somaxconn/backlog/syn_backlog 8192，承接数万并发新建；
+    #   缓冲：rmem/wmem 上限 64MB，交给内核自适应升档（长肥管道必需）；
+    #   拥塞：BBR + fq，弱网高延迟链路吞吐远优于 cubic；
+    #   notsent_lowat 128KB：发送队列别在内核里囤积，降低排队延迟与内存；
+    #   mtu_probing：PMTU 黑洞自动探测，避免大流量偶发卡死；
+    #   slow_start_after_idle=0：间歇流量不重跑慢启动。
     cat > /etc/sysctl.d/99-antipole.conf <<EOF
 net.ipv6.conf.all.forwarding=1
 net.ipv4.conf.all.forwarding=1
+net.core.somaxconn=8192
+net.core.netdev_max_backlog=8192
+net.ipv4.tcp_max_syn_backlog=8192
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.ipv4.tcp_rmem=4096 87380 67108864
+net.ipv4.tcp_wmem=4096 65536 67108864
+net.ipv4.tcp_notsent_lowat=131072
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=fq
+fs.file-max=2097152
 EOF
+    sysctl --system >/dev/null 2>&1 || true
 
     if [ "$HAS_SYSTEMD" = "1" ]; then
         cat > /etc/systemd/system/antipole.service <<EOF
@@ -356,12 +388,17 @@ Type=simple
 User=root
 WorkingDirectory=$APP_DIR
 Environment=PYTHONUNBUFFERED=1
+# 转发是内存拷贝密集型：抑制 glibc 归还堆，缺页率可降一个量级（1 核小机收益明显）
+Environment=MALLOC_TRIM_THRESHOLD_=-1
+Environment=MALLOC_MMAP_THRESHOLD_=134217728
+Environment=MALLOC_TOP_PAD_=33554432
+Environment=MALLOC_ARENA_MAX=1
 ExecStart=/usr/bin/python3 -m app.main $CONF_DIR/config.yaml
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=5
 MemoryMax=400M
-LimitNOFILE=65536
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -441,6 +478,7 @@ mkdir -p "$APP_DIR" "$CONF_DIR" "$CONF_DIR/keys"
 if [ "$SRC_DIR" != "$APP_DIR" ]; then
     cp -r "$SRC_DIR/app" "$SRC_DIR/test_smoke.py" "$APP_DIR/"
     cp "$SRC_DIR/requirements.txt" "$APP_DIR/"
+    [ -d "$SRC_DIR/tools" ] && cp -r "$SRC_DIR/tools" "$APP_DIR/" || true
     [ -f "$SRC_DIR/mc_index.html" ] && cp "$SRC_DIR/mc_index.html" "$APP_DIR/" || true
 else
     echo "    项目已位于 $APP_DIR，跳过拷贝"
@@ -470,7 +508,7 @@ if [ -x /usr/local/bin/wgcf ] && [ ! -f "$CONF_DIR/warp-profile.conf" ]; then
         || echo "    WARP 注册未完成，antipole 启动时将自动重试"
 fi
 
-say "[8/8] 自检与启动"
+say "[8/8] 离线自检与启动"
 (cd "$APP_DIR" && python3 test_smoke.py) || die "离线自检未通过，请检查上方输出"
 
 if [ "$HAS_SYSTEMD" = "1" ]; then

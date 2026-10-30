@@ -1,36 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-网络层（整合）：WireGuard / WARP / IPv6 地址池 / BGP 状态 / tc 限速 / 轮换。
-系统命令统一经 cmd() 执行，带超时与结果缓存，避免子进程消耗过多 CPU。
+网络/内核层：WireGuard、WARP 多隧道、路由与策略路由、tc 限速、DNS64/NAT64、
+出口轮换，以及已分配地址白名单守护。
+
+设计原则：
+  - 所有内核变更幂等（先删后加 / replace），可重复执行；
+  - 出口轮换只改内核路由 src，不重载 Xray，连接不中断；
+  - 地址守护：仅已分配给用户的 /128 允许进入本机与转发，
+    前缀内未分配地址一律丢弃，保证每个地址的独立性。
 """
 import asyncio
 import ipaddress
 import os
 import re
-import threading
 import time
 from pathlib import Path
 
-from .lock import Mutex
+from . import core
+from .core import (V6Pool, addr_for, cmd, have_bin, internal_ip,
+                   internal_v4, list_enabled_users, list_users, pool, tx)
 
 CFG = None
-_mutex = None
 
 # 命令结果的轻量缓存（广播/公钥/网关等低频变化数据）
 _cache = {"gw": {"dev": None, "gw": None, "ts": 0}, "wan": None}
 
 
 def setup(cfg: dict):
-    global CFG, _mutex
+    global CFG
     CFG = cfg
-    # 服务端与 CLI（antipole 命令）共用一把文件锁：服务端改内核/DB 用 shared，
-    # CLI 整条命令用 exclusive，实现进程间互斥。锁文件放 DB 同目录。
-    _mutex = Mutex(str(Path(cfg["db"]["path"]).parent / ".antipole.lock"))
-
-
-def tx() -> Mutex:
-    """进程级互斥锁：服务端 mutation 持 shared，CLI 整条命令持 exclusive。"""
-    return _mutex
 
 
 def _child_preexec(parent_pid: int):
@@ -50,101 +48,6 @@ def _child_preexec(parent_pid: int):
         except Exception:
             pass
     return _fn
-
-
-# ---------- 命令执行 ----------
-
-async def cmd(*args, check=True, stdin=None, timeout=15, cwd=None) -> str:
-    """执行系统命令并返回输出，带超时控制。超时即终止进程并抛出异常，避免事件循环阻塞。"""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdin=asyncio.subprocess.PIPE if stdin is not None else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd)
-        out, err = await asyncio.wait_for(
-            proc.communicate(input=stdin.encode() if stdin else None), timeout)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        raise RuntimeError(f"{' '.join(args)} 超时")
-    if check and proc.returncode != 0:
-        raise RuntimeError(f"{' '.join(args)} 失败: "
-                           f"{err.decode(errors='replace').strip()[:200]}")
-    return out.decode(errors="replace").strip()
-
-
-def have_bin(name: str) -> bool:
-    """命令是否存在于 PATH（缺失时对应功能降级）。"""
-    import os
-    return any(Path(p).joinpath(name).exists()
-               for p in os.environ.get("PATH", "").split(os.pathsep)
-               if p)
-
-
-# ---------- IPv6 地址池 ----------
-
-def _mix_seq(s: int) -> int:
-    """可逆位混合（splitmix64）：不同 seq 必映射到不同值，但相邻 seq 地址乱跳。
-    无状态、双射，不用记历史占用。"""
-    s = (s + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
-    s ^= s >> 30
-    s = (s * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
-    s ^= s >> 27
-    s = (s * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
-    s ^= s >> 31
-    return s & 0xFFFFFFFFFFFFFFFF
-
-
-class V6Pool:
-    """地址池：在广播前缀内为每个序号派生唯一 /128 出口地址。
-
-    支持任意前缀长度（建议 /48，允许 /32~/64）。序号经位混合（splitmix64）
-    打散后铺入前缀之后的低位，保证相邻序号地址无序随机且双射。
-    """
-
-    def __init__(self, prefix: str, start_seq: int = 1):
-        network = ipaddress.IPv6Network(prefix, strict=False)
-        if network.prefixlen > 64:
-            raise ValueError(
-                f"前缀过短: /{network.prefixlen}，可用出口地址不足，"
-                f"请使用 /64 或更短的前缀（如 /48）")
-        self.network = network
-        self.start_seq = start_seq
-
-    def addr(self, seq: int) -> str:
-        """按序号派生地址，显式展开 8 组，ip 命令不依赖缩写歧义。"""
-        mixed = _mix_seq(seq)
-        base = int(self.network.network_address)
-        host_bits = 128 - self.network.prefixlen
-        addr = base | (mixed & ((1 << host_bits) - 1))
-        groups = [(addr >> (112 - 16 * i)) & 0xFFFF for i in range(8)]
-        return ":".join(f"{g:x}" for g in groups)
-
-
-_pool = None
-
-
-def init_pool(prefix: str, start_seq: int = 1):
-    global _pool
-    _pool = V6Pool(prefix, start_seq)
-
-
-def pool():
-    if _pool is None:
-        raise RuntimeError("地址池没初始化")
-    return _pool
-
-
-def internal_ip(user_id: int) -> str:
-    return f"fd00:1::{user_id:x}"
-
-
-def internal_v4(user_id: int) -> str:
-    return f"10.7.0.{user_id}" if 1 <= user_id <= 254 else ""
 
 
 # ---------- 网关探测（缓存 60s） ----------
@@ -176,6 +79,18 @@ async def wan_dev() -> str:
     dev, _ = await default_gw()
     _cache["wan"] = dev
     return dev
+
+
+async def wan_v6() -> str:
+    """出口网卡的全局 IPv6 地址（首个）。用于把入站监听收敛到主地址，
+    把其余地址的端口（尤其是 80）留给证书校验与用户映射。"""
+    dev = await wan_dev()
+    out = await cmd("ip", "-6", "-o", "addr", "show", "dev", dev, check=False)
+    for line in out.splitlines():
+        match = re.search(r"inet6\s+([0-9a-fA-F:]+)/\d+\s+scope\s+global", line)
+        if match and not match.group(1).startswith("fe80"):
+            return match.group(1)
+    return ""
 
 
 # ---------- WireGuard ----------
@@ -243,8 +158,7 @@ async def wg_add_peer(user_id: int, pubkey: str):
     nc = _n()
     await cmd("ip", "link", "set", nc["wg_iface"], "up", check=False)   # 常驻确保接口 up
     ip6 = internal_ip(user_id)
-    from . import db as _db
-    user = _db.get_user(user_id)
+    user = core.get_user(user_id)
     if not user:
         raise RuntimeError(f"用户 {user_id} 不存在")
     await cmd("wg", "set", nc["wg_iface"], "peer", pubkey,
@@ -255,6 +169,7 @@ async def wg_add_peer(user_id: int, pubkey: str):
         await cmd("ip", "-4", "route", "replace", f"{v4}/32", "dev",
                   nc["wg_iface"], check=False)
     await _bind_egress(user_id, user["egress_ip"])
+    await addr_guard_add(user["egress_ip"])
     # 多 WARP 隧道负载均衡：用户 v4 流量按 id 精确分流到所属隧道
     await _warp_user_rule(user_id)
 
@@ -310,9 +225,12 @@ async def wg_rotate_egress(user_id: int, egress: str, old_egress: str):
               "src", egress, "table", str(tbl))
     for args in dns64_routes_for(tbl):
         await cmd(*args, check=False)
+    # 地址守护：先登记新出口再注销旧出口，切换过程无拒绝窗口
+    await addr_guard_add(egress)
     if old_egress and old_egress != egress:
         await cmd("ip", "-6", "addr", "del", f"{old_egress}/128", "dev", "lo",
                   check=False)
+        await addr_guard_del(old_egress)
 
 
 async def _unbind_egress(user_id: int):
@@ -324,11 +242,11 @@ async def _unbind_egress(user_id: int):
     await cmd("ip", "-6", "rule", "del", "fwmark", hex(mark),
               "lookup", str(tbl), check=False)
     await cmd("ip", "-6", "route", "flush", "table", str(tbl), check=False)
-    from . import db as _db
-    user = _db.get_user(user_id)
+    user = core.get_user(user_id)
     if user and user["egress_ip"]:
         await cmd("ip", "-6", "addr", "del", f"{user['egress_ip']}/128",
                   "dev", "lo", check=False)
+        await addr_guard_del(user["egress_ip"])
 
 
 async def wg_dump() -> dict:
@@ -348,6 +266,224 @@ async def wg_dump() -> dict:
         peers[fields[0]] = {"internal": internal, "handshake": int(fields[4] or 0),
                        "endpoint": fields[3] or None}
     return peers
+
+
+# ---------- 已分配地址守护 ----------
+# 广播前缀内的地址若无业务占用，不应被路由到本机（否则任意 /128 均可达本机，
+# 破坏地址独立性并放大攻击面）。实现方式：nftables interval 集合保存已分配 /128，
+# 在 prerouting 早期放行集合内地址、丢弃前缀内其余地址。集合查找为 O(1)，
+# 用户增删时增量更新元素，不做全量重写。
+
+_ADDR_TABLE = "antipole-addr"
+_ADDR_SET = "allocated"
+_ADDR_CHUNK = 500        # 单次 nft 调用批量写入的元素数（避免命令过长）
+
+
+def _guard_on() -> bool:
+    return bool(CFG["network"].get("guard_allocated", True)) and have_bin("nft")
+
+
+async def ensure_local_v6(addr: str):
+    """确保一个 /128 绑在本机 lo 上（幂等）：BGP /48 内的固定服务接入地址
+    （如 VLESS 统一入口）不随实例重建变化，必须在服务启动时先于监听存在。
+    存在性判断用 `show dev lo` 输出过滤——`addr show <地址>` 会被当作设备名，
+    永远返回空，导致重复 add 撞 RTNETLINK File exists。
+    """
+    addr = (addr or "").strip()
+    if not addr:
+        return
+    out = await cmd("ip", "-6", "addr", "show", "dev", "lo", check=False)
+    if addr in out:
+        return
+    await cmd("ip", "-6", "addr", "add", f"{addr}/128", "dev", "lo")
+    print(f"[net] 本机服务地址已就绪 {addr}")
+
+
+def _guard_prefixes() -> list:
+    prefixes = [p for p in (CFG["network"].get("ranges") or {}).values() if p]
+    return prefixes or [CFG["network"]["prefix"]]
+
+
+async def local_v6_addresses() -> set:
+    """本机全部非链路本地 IPv6 地址。
+
+    这些地址承载本机自身服务（如既有 DNS 业务），必须始终放行且不得分配给用户，
+    否则地址守护会误伤本机业务，或用户地址与本机业务地址冲突。
+    """
+    out = await cmd("ip", "-6", "-o", "addr", "show", check=False)
+    addrs = set()
+    for line in out.splitlines():
+        match = re.search(r"inet6\s+([0-9a-fA-F:]+)/", line)
+        if match and not match.group(1).startswith("fe80"):
+            addrs.add(match.group(1))
+    return addrs
+
+
+async def refresh_reserved():
+    """刷新保留地址集合：本机地址 + 配置的额外放行项。"""
+    addrs = await local_v6_addresses()
+    addrs |= set(CFG["network"].get("guard_extra_allow") or [])
+    core.set_reserved(addrs)
+    return addrs
+
+
+async def addr_guard_init():
+    """重建地址守护表与规则（幂等）。返回是否启用。"""
+    if not _guard_on():
+        return False
+    prefixes = _guard_prefixes()
+    await cmd("nft", "delete", "table", "inet", _ADDR_TABLE, check=False)
+    await cmd("nft", "add", "table", "inet", _ADDR_TABLE)
+    await cmd("nft", "add", "set", "inet", _ADDR_TABLE, _ADDR_SET,
+              "{ type ipv6_addr ; flags interval ; }")
+    await cmd("nft", "add", "chain", "inet", _ADDR_TABLE, "guard",
+              "{ type filter hook prerouting priority -150 ; policy accept ; }")
+    # 顺序敏感：先放行集合内地址，再丢弃前缀内其余地址
+    await cmd("nft", "add", "rule", "inet", _ADDR_TABLE, "guard",
+              f"ip6 daddr @{_ADDR_SET}", "accept")
+    for prefix in prefixes:
+        await cmd("nft", "add", "rule", "inet", _ADDR_TABLE, "guard",
+                  f"ip6 daddr {prefix}", "drop")
+    await addr_guard_sync()
+    print(f"[net] 地址守护已启用：仅已分配地址与本机地址可路由至本机"
+          f"（前缀 {', '.join(prefixes)}）")
+    return True
+
+
+async def addr_guard_sync():
+    """按数据库地址 + 本机地址 + 额外放行项全量重写集合（批量写入）。"""
+    if not _guard_on():
+        return
+    addrs = {u["egress_ip"] for u in list_users() if u.get("egress_ip")}
+    addrs |= await refresh_reserved()
+    ordered = sorted(addrs)
+    await cmd("nft", "flush", "set", "inet", _ADDR_TABLE, _ADDR_SET, check=False)
+    for i in range(0, len(ordered), _ADDR_CHUNK):
+        chunk = ", ".join(ordered[i:i + _ADDR_CHUNK])
+        await cmd("nft", "add", "element", "inet", _ADDR_TABLE, _ADDR_SET,
+                  f"{{ {chunk} }}", check=False)
+
+
+async def addr_guard_add(addr: str):
+    """登记一个已分配地址。"""
+    if not _guard_on() or not addr:
+        return
+    await cmd("nft", "add", "element", "inet", _ADDR_TABLE, _ADDR_SET,
+              f"{{ {addr} }}", check=False)
+
+
+async def addr_guard_del(addr: str):
+    """注销一个地址（用户删除/轮换旧出口）。"""
+    if not _guard_on() or not addr:
+        return
+    await cmd("nft", "delete", "element", "inet", _ADDR_TABLE, _ADDR_SET,
+              f"{{ {addr} }}", check=False)
+
+
+# ---------- 隧道控制面 ----------
+
+def tunnel_control_addr() -> str:
+    """隧道控制面接入地址：隧道专属网段的第一个可用地址。
+
+    控制面固定占用该地址，客户端统一以它作为接入点；与用户出口地址同属隧道
+    网段，但独立保留，不会被分配给任何用户。
+    """
+    tunnel_range = (_n().get("tunnel_range") or "").strip()
+    if not tunnel_range:
+        return ""
+    net6 = ipaddress.IPv6Network(tunnel_range, strict=False)
+    if net6.num_addresses <= 1:
+        return ""
+    return str(net6.network_address + 1)
+
+
+async def ensure_tunnel_addr() -> str:
+    """把隧道控制地址挂载到 lo 并登记放行（幂等；隧道未启用时跳过）。"""
+    if not CFG["tunnel"].get("enabled"):
+        return ""
+    addr = tunnel_control_addr()
+    if not addr:
+        return ""
+    await cmd("ip", "-6", "addr", "add", f"{addr}/128", "dev", "lo", "nodad",
+              check=False)
+    await addr_guard_add(addr)
+    return addr
+
+
+# ---------- 端口放行 ----------
+# 隧道控制端口、用户映射端口、自助注册端口都是运行时才确定的，无法预置到静态防火墙
+# 脚本里，必须由程序按需放行，否则流量会被系统防火墙（ufw/iptables）丢弃。
+
+_FW_TABLE = "antipole-fw"
+_FW_SET = "dynamic_ports"
+_fw_backend = None            # None 未探测 / True 用 ufw / False 用 nft 集合
+
+
+async def _fw_use_ufw() -> bool:
+    """探测一次主防火墙形态：ufw 生效时写 ufw 规则，否则退回 nft 集合。"""
+    global _fw_backend
+    if _fw_backend is None:
+        if not have_bin("ufw"):
+            _fw_backend = False
+        else:
+            out = await cmd("ufw", "status", check=False)
+            _fw_backend = "Status: active" in out
+    return _fw_backend
+
+
+async def _fw_nft_ready():
+    """准备 nft 兜底表、input 链与动态端口集合（幂等）。"""
+    if not have_bin("nft"):
+        return False
+    await cmd("nft", "add", "table", "inet", _FW_TABLE, check=False)
+    await cmd("nft", "add", "chain", "inet", _FW_TABLE, "input",
+              "{ type filter hook input priority -10 ; policy accept ; }",
+              check=False)
+    await cmd("nft", "add", "set", "inet", _FW_TABLE, _FW_SET,
+              "{ type inet_service ; }", check=False)
+    rules = await cmd("nft", "list", "chain", "inet", _FW_TABLE, "input",
+                      check=False)
+    if f"@{_FW_SET}" not in rules:
+        await cmd("nft", "add", "rule", "inet", _FW_TABLE, "input",
+                  f"tcp dport @{_FW_SET} accept", check=False)
+    return True
+
+
+async def fw_open(port: int):
+    """放行一个入站 TCP 端口（重复调用幂等）。
+
+    防火墙异常不应影响映射建立，因此内部吞掉错误并打印提示。
+    """
+    try:
+        port = int(port)
+        if not 0 < port < 65536:
+            return
+        if await _fw_use_ufw():
+            await cmd("ufw", "allow", f"{port}/tcp", check=False)
+            return
+        if not await _fw_nft_ready():
+            return
+        await cmd("nft", "add", "element", "inet", _FW_TABLE, _FW_SET,
+                  f"{{ {port} }}", check=False)
+    except Exception as e:
+        print(f"[net] 端口 {port} 放行失败: {e}")
+
+
+async def fw_close(port: int):
+    """撤销端口放行（该端口已无任何监听时调用）。"""
+    try:
+        port = int(port)
+        if not 0 < port < 65536:
+            return
+        if await _fw_use_ufw():
+            await cmd("ufw", "delete", "allow", f"{port}/tcp", check=False)
+            return
+        if not await _fw_nft_ready():
+            return
+        await cmd("nft", "delete", "element", "inet", _FW_TABLE, _FW_SET,
+                  f"{{ {port} }}", check=False)
+    except Exception as e:
+        print(f"[net] 端口 {port} 撤销放行失败: {e}")
 
 
 # ---------- WARP ----------
@@ -588,8 +724,7 @@ async def warp_up() -> bool:
             await cmd("nft", "add", "rule", "ip", "antipole", "mangle-fwd",
                       f'iifname "{_n()["wg_iface"]}" meta mark set {_warp_mark(1)}')
         else:
-            from . import db as _db
-            for user in _db.list_enabled_users():
+            for user in list_enabled_users():
                 await _warp_user_rule(user["id"])
     # NAT64 源地址借道 WARP 的 SNAT（有 v4 才算数）
     if first_v4:
@@ -731,8 +866,7 @@ async def tc_set_rate(user_id: int, mbps: int):
         return "tc 不可用"
     if not CFG["network"].get("tc_enabled", True):
         return "限速已关闭"
-    from . import db as _db
-    user = _db.get_user(user_id)
+    user = core.get_user(user_id)
     if not user:
         return "用户不存在"
     try:
@@ -971,20 +1105,32 @@ def dns64_stop():
 # ---------- 轮换 ----------
 
 class Rotator:
-    """每个用户独立、随机时间点、随机间隔换 IP（模拟 ISP 租约，避免固定/同步规律被风控识破）。"""
+    """出口轮换：默认关闭，地址与账户绑定、永久不变。
+
+    打开 `rotation.enabled` 后才会按"每用户独立、随机时间点、随机间隔"换 IP
+    （模拟 ISP 租约，避免固定规律被风控识破）；隧道用户的静态地址是端口映射与
+    证书的锚点，即使开启轮换也不参与。
+    """
 
     def __init__(self, cfg: dict):
         rot_cfg = cfg["rotation"]
+        self.enabled = bool(rot_cfg.get("enabled", False))
         self.min_interval = int(rot_cfg.get("min_interval", 1800))   # 30 分钟
         self.max_interval = int(rot_cfg.get("max_interval", 7200))   # 2 小时
         self.start_seq = rot_cfg["start_seq"]
         self.online = {}
         self._next = {}            # user_id -> 下一次轮换的绝对时间戳
         self._tick = 30            # 调度粒度（秒）
+        self._tasks = []           # 常驻任务引用
 
     async def run(self):
-        asyncio.create_task(self._rotate())
-        asyncio.create_task(self._status())
+        if not self.enabled:
+            # 地址与账户绑定：不做任何轮换，也不建立轮换任务
+            print("[rotate] 出口轮换未启用（rotation.enabled=false），地址永久绑定账户")
+            return
+        # 轮换任务长期运行，必须持有强引用（asyncio 仅持弱引用，可能被回收）
+        self._tasks = [asyncio.ensure_future(self._rotate()),
+                       asyncio.ensure_future(self._status())]
 
     @staticmethod
     def _rand_delay(lo: int, hi: int) -> int:
@@ -1015,8 +1161,11 @@ class Rotator:
         while True:
             now = int(time.time())
             try:
+                tunnel_uids = {row["user_id"] for row in core.list_tunnel_users()}
                 due = []
-                for user in db_list_enabled():
+                for user in list_enabled_users():
+                    if user["id"] in tunnel_uids:
+                        continue           # 隧道用户地址永久绑定，不参与轮换
                     self._schedule(user["id"], now) if user["id"] not in self._next else None
                     if self._next.get(user["id"], 0) <= now:
                         due.append(user)
@@ -1036,19 +1185,26 @@ class Rotator:
             await asyncio.sleep(60)
 
     async def rotate_one(self, user: dict) -> str:
-        """轮换单个用户的出口 /128。单个用户失败不影响其他用户。"""
-        from . import db
+        """轮换单个用户的出口 /128（保持在其所属命名网段内）。单用户失败不影响其他用户。
+
+        隧道用户例外：其静态地址被端口映射、证书校验与用户侧配置长期引用，
+        换掉会让已建立的映射与已签发证书失配，因此直接拒绝。
+        """
+        if core.get_tunnel_user(user["id"]):
+            raise RuntimeError(
+                f"{user['name']} 为隧道用户，静态地址与账户绑定（用于端口映射与证书），不允许轮换")
         with tx().shared():    # 与 CLI 互斥：避免与 `antipole user rotate` 并发修改
             seq = user["rotate_seq"]
-            others = {other["egress_ip"] for other in db.list_users()
-                      if other["id"] != user["id"]}
+            range_name = user.get("range_name", "") or ""
+            # 排除其他用户地址与本机保留地址，避免冲突
+            others = core.used_egress_ips(exclude_user_id=user["id"])
             while True:
                 seq += 1
-                egress = pool().addr(seq)
+                egress = addr_for(range_name, seq)
                 if egress not in others:
                     break
             await wg_rotate_egress(user["id"], egress, user["egress_ip"])
-            db.update_user(user["id"], egress_ip=egress, rotate_seq=seq)
+            core.update_user(user["id"], egress_ip=egress, rotate_seq=seq)
             # 限速 listener 跟着新出口走（filter 按 src 匹配）
             if user["max_mbps"]:
                 await tc_set_rate(user["id"], user["max_mbps"])
@@ -1057,19 +1213,9 @@ class Rotator:
     async def refresh_status(self):
         peers = await wg_dump()
         now = int(time.time())
-        for user in db_list_users():
+        for user in list_users():
             info = peers.get(user["pubkey"])
             if info and info["handshake"] and now - info["handshake"] / 1e9 < 300:
                 self.online[user["id"]] = int(info["handshake"] / 1e9)
             else:
                 self.online.pop(user["id"], None)
-
-
-def db_list_users():
-    from . import db
-    return db.list_users()
-
-
-def db_list_enabled():
-    from . import db
-    return db.list_enabled_users()

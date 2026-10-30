@@ -1,0 +1,7 @@
+# 脚本一律 LF：Windows 上按 CRLF 检出会让 shebang/bash 直接跑挂
+*.sh       text eol=lf
+tools/antipole-c text eol=lf
+install.sh text eol=lf
+# 二进制按原样处理
+*.exe      binary
+*.png      binary
