@@ -112,15 +112,15 @@ if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
     HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 fi
 
-fetch() {   # fetch <文件名> <目标>
+fetch() {   # fetch <文件名> <目标>：本地（脚本同目录）优先，否则从仓库 tools/ 下载
     local name=$1 dest=$2
     if [ -n "$HERE" ] && [ -f "$HERE/$name" ]; then
         cp "$HERE/$name" "$dest"; ok "$name（本地）"; return
     fi
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --connect-timeout 10 "$RAW/$name" -o "$dest" || die "下载失败：$RAW/$name"
+        curl -fsSL --connect-timeout 10 "$RAW/tools/$name" -o "$dest" || die "下载失败：$RAW/tools/$name"
     elif command -v wget >/dev/null 2>&1; then
-        wget -qT 15 "$RAW/$name" -O "$dest" || die "下载失败：$RAW/$name"
+        wget -qT 15 "$RAW/tools/$name" -O "$dest" || die "下载失败：$RAW/tools/$name"
     else
         die "系统缺少 curl/wget，无法下载；请先安装其一"
     fi
