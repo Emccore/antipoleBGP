@@ -1,6 +1,6 @@
 # antipoleBGP 出口调度管理系统
 
-**版本：V3.20**
+**版本：V3.21**
 
 antipoleBGP 是一套面向多用户运营场景的 IPv6 出口调度与网络接入管理系统。系统基于 BGP 广播前缀，为每个用户分配独立的 /128 IPv6 出口地址，**地址与账户绑定、永久不变**（如需按租约轮换可在配置中显式开启，隧道用户始终不参与）；在此基础上提供 VLESS Reality 代理接入、WireGuard 全隧道接入、类 frp 的 TCP 端口映射隧道、多业务命名网段、可选自助注册服务、反滥用防护与地址独立性守护。
 
@@ -101,7 +101,9 @@ tools/
 bin/
   antipole-relay          数据面中继二进制（可选，自行编译放入；缺失时用 Python 数据面）
 dist/
-  antipole-tunnel.exe      Windows 图形客户端（单文件，双击即用）
+  antipole-tunnel.exe      Windows 图形客户端（单文件，双击即用；二进制由 Releases 分发，不入库）
+.github/workflows/
+  build-client.yml        打 tag 时在 GitHub 机器上打包 exe 并挂到 Release 资产
 deploy/
   deploy.sh            部署入口
   firewall.sh          防火墙规则
@@ -383,7 +385,7 @@ SYN，表现为连接一直超时。由于每个用户独占自己的 /128、彼
 ### 7.4 客户端部署（用户主机）
 
 客户端为单文件脚本，**Windows / Linux / macOS 通用，仅需 Python 3.8+，无第三方依赖**。
-Windows 另提供图形界面版 `dist\antipole-tunnel.exe`（填接入地址与 UserID，连接后直接显示取到的
+Windows 另提供图形界面版（`dist\antipole-tunnel.exe`，从 Releases 下载或本机打包；填接入地址与 UserID，连接后直接显示取到的
 公网地址）；Linux 用 `tools/antipole-c` 统一管理（systemd 常驻，见 7.8）。
 
 ```bash
@@ -539,7 +541,7 @@ tunnel:
 
 TLS 启用后服务端自动以 TLS 监听控制端口，客户端无需额外参数即可连接（SNI 与证书域名一致）。
 
-### 7.8 客户端管理（Linux，antipole-c）
+### 7.8 客户端管理（Linux `antipole-c` / Windows 安装脚本）
 
 Linux 上用一个脚本管理多条隧道连接，背后交给 systemd 常驻（无 systemd 时退回 nohup 后台）。
 
@@ -553,9 +555,13 @@ curl -fsSL https://raw.githubusercontent.com/Emccore/antipoleBGP/main/tools/inst
 curl -fsSL https://raw.githubusercontent.com/Emccore/antipoleBGP/main/tools/install-client.sh | sudo bash -s -- \
     --server '[2600:1:2:ff00::1]:18281' --token <用户Token> --map 8080 --map 9000
 
-# Windows：装图形客户端并创建桌面快捷方式
+# Windows：装图形客户端并创建桌面快捷方式（程序从 Releases 下载，受网络限制不入库）
 irm https://raw.githubusercontent.com/Emccore/antipoleBGP/main/tools/install-client.ps1 | iex
 ```
+
+Windows 也可以直接下载单文件客户端：<https://github.com/Emccore/antipoleBGP/releases/latest/download/antipole-tunnel.exe>
+（同名 `.sha256` 一并提供，安装脚本会自动比对）。打 tag（如 `v3.21.0`）时 GitHub Actions 自动打包新 exe 并上传到对应 Release，
+本地网络无需上传二进制；需要自定义版本时用 `tools/build-win-exe.bat` 在本机打包。
 
 装完会打印常用命令（状态 / 日志 / 停止 / 申请证书 / 卸载）。
 
@@ -779,6 +785,7 @@ scrape_configs:
 
 | 版本   | 说明                                                                                                                                                                                                                                                                                                                                                                                 |
 | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| V3.21 | 开源发布与一键安装：① 源码推送至 `Emccore/antipoleBGP`（配置与二进制不入库，防密钥泄漏、绕开本地上传体积限制）；② `tools/install-client.sh` ——Linux/macOS 一条命令装完即问答建连接（自动装 python3、写入 systemd 模板、开机自启，支持 `--server/--token/--map/--cert-domain` 非交互直连与 `--uninstall`）；③ `tools/install-client.ps1` ——Windows 一条命令装图形客户端：从 Release 下载、SHA256 比对、去网络标记、建桌面快捷方式、`-Uninstall` 卸载；④ `.github/workflows/build-client.yml` ——打 tag（如 `v3.21.0`）即在 GitHub 机器上打包 exe 并上传 Release 资产（含 `.sha256`），本地网络无需上传 11MB 二进制；⑤ README 增补客户端安装段与 Release 分发说明 |
 | V3.20 | 代理伪装强化：① Reality 入站 **80 → 443**——在明文 HTTP 端口上跑 TLS 流量是 DPI 一眼可辨的特征，迁移后与 dest 真实站点（apple.com 的 443）完全对齐，非授权探测者拿到的就是 Apple EV 证书（实测 `openssl s_client` 返回 `CN=www.apple.com` / Apple Public EV CA）；链接端口自动跟随为 `network.2008828.xyz:443`；② **80 端口改为真实网站**（mc 伪装站点公网化）——接入地址 80 常驻 MC 首页（实测 200 / 557KB），"443 有 apple.com TLS + 80 有真实网站"组合成正常服务器画像，空端口/拒绝响应本身反倒是特征；③ 去掉 Reality 下无意义的 `fallbacks` 生成（Reality 非授权流量直接代理 dest，fallbacks 纯属多余配置特征）；④ 提醒：客户端链接端口需更新为 443 |
 | V3.19 | VLESS 统一固定接入地址 + 修复代理被打断：① 新增 `xray.listen`——VLESS 入站监听与**全部分享链接**统一指定 BGP /48 内的固定 /128（现 `2a14:7583:ef30:1145::1`），不再依赖随实例重建变化的 Vultr 动态主地址，链接永不失效；服务启动时自动把该地址挂上 lo（幂等）并加入地址守护集合，持久放行入站端口；`vless_link`/`user get`/`link` 输出全部统一；② 新增 `xray.announce` **自填域名**——分享链接地址优先级 `announce > listen > 域名表 > 公网 IP`，AAAA 记录指向 listen 地址即可（现 `network.2008828.xyz`），换别名域名只改这一处、无需动任何监听；③ 定位并修复"常规连接用不了"根因——V3.15 证书流程结束时的 `fw_close(80)` 是**全局删除**放行，把同端口的 VLESS 入站一并打断；现证书流程结束时改为保留放行（幂等 `fw_open`），且 Xray 启动即放行入站端口，杜绝再次互相误删；④ `ensure_local_v6` 存在性判断修正：`ip addr show <地址>` 会被 iproute2 当设备名永远返回空，导致重复 add 撞 `File exists` 崩掉整个 Xray 初始化，改为 `show dev lo` 输出过滤；⑤ `tunnel_range` 显式固定 `fe00::/56`（隧道接入地址 `fe00::1` 客户端已固化，不能走"主前缀最后一个 /56"自动派生漂移）；⑥ 恢复线上配置事故：服务实际读取 `/etc/antipole/config.yaml`（此前部署只同步 /root 下无效副本），误以开发模板覆盖后已从 20260924 备份 + 运行日志交叉核对重建（`tunnel_range`/`admin_allow`/`warp profiles` 等以最新运行行为为准），工作区 config.yaml 同步替换为线上真实配置防再犯 |
 | V3.18 | 极限压榨与 splice 实验定论：① 完整实现内核 **splice 零拷贝**搬运（1MB 池化管道、EAGAIN 精细状态机——源取空立即排空防"管道占满→窗口 0→上游互等"死锁、EOF 先排空再上报、错误路径清管防脏池串数据），修掉两版初稿的死锁与尾部 99 字节错乱；② **实测定论：5MB/s 级 WAN 瓶颈链路上 splice 反而 20 ms/MB**（劣化 4 倍）——排空速率受限使 1MB 管道永远填不满，模式碎片化 + poller 挂起/唤醒次数暴涨；read+自适应攒批在同链路 **5.0 ms/MB 仍是最优**（splice 省的用户态拷贝 ~1.5ms 抵不过碎片化调度开销）。故 splice 做成 `-splice` 开关**默认关闭**，回环/内网等高吞吐场景可开（此时零拷贝优势成立）；③ 2ms/MB 结论：瓶颈在内核 TCP 协议栈逐包处理与 WAN 排空速率（物理约束），1 vCPU + 5MB/s 链路上 5.0 已贴近下限；200MB 完整性复核 `size=209715200`、`exit=0` |

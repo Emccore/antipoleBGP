@@ -1,0 +1,51 @@
+name: Build Windows client
+
+# 在 GitHub 的机器上打包 exe 并挂到 Release（本地网络对 >10MB 的上传请求有体积限制，
+# 因此二进制不走 git push，而是由本工作流产出 Release 资产）
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build exe
+        run: cmd /c tools\build-win-exe.bat
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist\antipole-tunnel.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  antipole-tunnel.exe" | Out-File -Encoding ascii dist\antipole-tunnel.exe.sha256
+          "SHA256 $h"
+
+      - name: Publish to Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v') { $tag = "v3.20.0" }   # 手动触发时挂到当前版本
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag dist/antipole-tunnel.exe dist/antipole-tunnel.exe.sha256 `
+              --title "$tag Windows client" --notes "antipoleBGP Windows 单文件客户端"
+          } else {
+            gh release upload $tag dist/antipole-tunnel.exe dist/antipole-tunnel.exe.sha256 --clobber
+          }
+          if ($LASTEXITCODE -ne 0) { throw "upload failed" }
