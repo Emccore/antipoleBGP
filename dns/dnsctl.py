@@ -332,7 +332,7 @@ def query_udp(server, name, qtype=1, timeout=QUERY_TIMEOUT):
         s.close()
 
 
-def _split_hostport(server, dport):
+def _split_hostport(server, dport=53):
     server = server.strip()
     if server.startswith("["):                       # [v6]:port
         host, _, rest = server[1:].partition("]")
