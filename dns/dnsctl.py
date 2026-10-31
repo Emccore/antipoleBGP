@@ -17,8 +17,10 @@
 # 依赖：python3 + PyYAML（apt install python3-yaml）；其余仅标准库。
 import argparse
 import difflib
+import glob
 import os
 import random
+import re
 import shutil
 import socket
 import ssl
@@ -518,6 +520,111 @@ def cmd_test(args, cfg):
     return 0 if ips else 2
 
 
+# ---------------- 换地址 / 换域名 / 反滥用 ----------------
+
+NGINX_MTLS_CONF = "/etc/nginx-mtls/nginx.conf"
+
+
+def _sub_tree(root, old, new, globs=()):
+    """替换 root 下（含 glob 追加）文本文件中的 old→new，返回改动文件清单。"""
+    files = []
+    for p in [root] + [f for g in globs for f in __import__("glob").glob(g)]:
+        if not os.path.isfile(p) or os.path.islink(p):
+            continue
+        try:
+            t = open(p, encoding="utf-8").read()
+        except Exception:
+            continue
+        if old in t:
+            shutil.copy2(p, p + ".bak-swap")
+            open(p, "w", encoding="utf-8").write(t.replace(old, new))
+            files.append(p)
+    return files
+
+
+def _reload_all():
+    sh("systemctl reload mosdns || systemctl restart mosdns")
+    r = sh(f"/opt/nginx-mtls/sbin/nginx -t -c {NGINX_MTLS_CONF}")
+    if r.returncode == 0:
+        sh(f"/opt/nginx-mtls/sbin/nginx -c {NGINX_MTLS_CONF} -s reload")
+        print("✓ mosdns / nginx-mtls 已重载")
+    else:
+        print(f"✗ nginx -t 失败，未重载：{r.stderr.strip()}")
+
+
+def cmd_addr(args, cfg):
+    """addr switch <旧地址> <新地址>：换 DoT/DoH/mTLS 接入地址（证书与域名不受影响）。"""
+    old, new = args.old.strip("[]"), args.new.strip("[]")
+    if old == new:
+        return
+    y = open(args.config, encoding="utf-8").read()
+    if f"[{old}]" not in y:
+        sys.exit(f"配置里找不到 [{old}]")
+    open(args.config, "w", encoding="utf-8").write(y.replace(f"[{old}]", f"[{new}]"))
+    changed = [args.config]
+    changed += _sub_tree(NGINX_MTLS_CONF, f"[{old}]", f"[{new}]")
+    changed += _sub_tree(NGINX_MTLS_CONF, old, new, globs=["/etc/nginx-mtls/stream.d/*.conf"])
+    print("已替换：" + ", ".join(dict.fromkeys(changed)))
+    sh("ufw allow proto tcp from any to any port 853,25353,11451,80 2>/dev/null || true")
+    cfg2 = load_config(args.config)
+    do_apply(cfg2, restart=True, yes=True)
+    print(f"\n完成。请把相关域名 AAAA 记录改指 [{new}]（Cloudflare 控制台）。")
+
+
+def cmd_domain(args, cfg):
+    """domain switch <新域名>：重签证书+换 server_name（新域名 AAAA 需已指向本服务器）。"""
+    dom = args.domain
+    dot = cfg.get("listen", {}).get("dot", {})
+    cert = dot.get("cert", "")
+    try:
+        old = subprocess.run(["openssl", "x509", "-in", cert, "-noout", "-subject"],
+                             capture_output=True, text=True).stdout
+        old = old.split("CN =")[-1].strip()
+    except Exception:
+        sys.exit("无法从现有证书读取当前域名")
+    print(f"换域名：{old} → {dom}")
+    r = sh(f"/root/.acme.sh/acme.sh --issue -d {dom} -w /var/www/acme --keylength ec-256 --server letsencrypt")
+    if r.returncode != 0:
+        print(r.stdout[-500:]); sys.exit("签发失败：确认新域名 AAAA 已指向本服务器（80 已自动可达）")
+    d = f"/etc/antipole-dns/cert/{dom}"
+    os.makedirs(d, exist_ok=True)
+    r = sh(f"/root/.acme.sh/acme.sh --install-cert -d {dom} --ecc "
+           f"--fullchain-file {d}/fullchain.pem --key-file {d}/key.pem "
+           f"--reloadcmd 'systemctl reload mosdns; /opt/nginx-mtls/sbin/nginx -c {NGINX_MTLS_CONF} -s reload; logger -t acme-cert \"{dom} renewed\"'")
+    print(r.stdout.strip().splitlines()[-1] if r.stdout else "")
+    y = open(args.config, encoding="utf-8").read()
+    open(args.config, "w", encoding="utf-8").write(
+        y.replace("/etc/antipole-dns/cert/us-dns-fullchain.pem", f"{d}/fullchain.pem")
+         .replace("/etc/antipole-dns/cert/us-dns-key.pem", f"{d}/key.pem"))
+    changed = _sub_tree(NGINX_MTLS_CONF, old, dom) + _sub_tree(
+        NGINX_MTLS_CONF, old, dom, globs=["/etc/nginx-mtls/stream.d/*.conf"])
+    print("nginx 引用已替换：" + (", ".join(dict.fromkeys(changed)) or "（无）"))
+    do_apply(load_config(args.config), restart=True, yes=True)
+    print(f"\n完成。请把 DNS 记录改指新域名 {dom}。旧证书保留在 /root/.acme.sh/。")
+
+
+def cmd_guard(args, cfg):
+    """反滥用兜底：对外 53/udp 显式拒绝（防 DNS 反射放大），WG 内网放行。"""
+    print("▸ 对外 53/udp 监听检查")
+    out = sh("ss -lunp | grep ':53 '").stdout
+    bad = [l for l in out.splitlines()
+           if l and not re.search(r"(127\.0\.0\.1|\[?fd00:1::1\]?|\[?::1\]?|127\.0\.0\.53)", l)]
+    if bad:
+        print("  ✗ 发现对外 53/udp 监听（反射风险）：")
+        for l in bad:
+            print("    " + l)
+    else:
+        print("  ✓ 仅本机/WG 内网监听，无反射风险")
+    print("▸ 防火墙兜底（放行 WG 内网 → 拒绝其余 53/udp）")
+    sh("ufw insert 1 allow proto udp from fd00:1::/64 to any port 53 2>/dev/null")
+    sh("ufw insert 1 allow proto udp from 10.7.0.0/24 to any port 53 2>/dev/null")
+    r = sh("ufw deny proto udp from any to any port 53")
+    print("  ✓ " + (r.stdout.strip().splitlines()[-1] if r.stdout else "规则已写入"))
+    r = sh("ufw status | grep '53/udp'")
+    print("  " + "\n  ".join(r.stdout.strip().splitlines()))
+    return 1 if bad else 0
+
+
 # ---------------- 分流表 / 拦截表 ----------------
 
 def _fetch(url):
@@ -627,6 +734,20 @@ def main():
     p.add_argument("--url")
     p.add_argument("--enable", action="store_true")
     p.set_defaults(fn=lambda a, c: cmd_blocklist(c, a) if a.action == "update" else None)
+
+    p = sub.add_parser("addr", help="换接入地址")
+    p.add_argument("action", choices=["switch"])
+    p.add_argument("old", help="旧地址（不带端口）")
+    p.add_argument("new", help="新地址（不带端口）")
+    p.set_defaults(fn=lambda a, c: cmd_addr(a, c) if a.action == "switch" else None)
+
+    p = sub.add_parser("domain", help="一键换域名（自动重签证书）")
+    p.add_argument("action", choices=["switch"])
+    p.add_argument("domain", help="新域名（AAAA 需已指向本服务器）")
+    p.set_defaults(fn=lambda a, c: cmd_domain(a, c) if a.action == "switch" else None)
+
+    p = sub.add_parser("guard", help="反滥用加固（防 DNS 反射）")
+    p.set_defaults(fn=cmd_guard)
 
     p = sub.add_parser("version", help="版本")
     p.set_defaults(fn=lambda a, c: print(f"antipole-dns (dnsctl) v{VERSION}"))
