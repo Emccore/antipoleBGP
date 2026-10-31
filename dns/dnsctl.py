@@ -615,9 +615,9 @@ def cmd_guard(args, cfg):
             print("    " + l)
     else:
         print("  ✓ 仅本机/WG 内网监听，无反射风险")
-    print("▸ 防火墙兜底（放行 WG 内网 → 拒绝其余 53/udp）")
-    sh("ufw insert 1 allow proto udp from fd00:1::/64 to any port 53 2>/dev/null")
-    sh("ufw insert 1 allow proto udp from 10.7.0.0/24 to any port 53 2>/dev/null")
+    print("▸ 防火墙兜底（先放行 WG 内网，末尾拒绝其余 53/udp）")
+    sh("ufw allow from fd00:1::/64 to any port 53 proto udp")
+    sh("ufw allow from 10.7.0.0/24 to any port 53 proto udp")
     r = sh("ufw deny proto udp from any to any port 53")
     print("  ✓ " + (r.stdout.strip().splitlines()[-1] if r.stdout else "规则已写入"))
     r = sh("ufw status | grep '53/udp'")
