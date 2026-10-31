@@ -1,0 +1,57 @@
+# antipole-dns 配置 · dnsctl render/apply 按此生成 mosdns 与 unbound 配置
+# 所有默认值即现网行为；改动后 dnsctl apply 落盘并热重载
+
+general:
+  log_level: info
+
+# 缓存：size 条目上限；lazy_ttl 秒内过期记录仍可答（后台刷新）
+cache:
+  size: 20480
+  lazy_ttl: 86400
+
+# 上游
+# domestic：国内明文 UDP（快），多路并发，掉一个自动用剩余
+# foreign ：国外加密 DoT（默认 853），并发竞速
+upstreams:
+  domestic:
+    - "2400:3200::1"        # 阿里
+    - "2402:4e00::"         # 腾讯
+  foreign:
+    - "tls://[2606:4700:4700::1111]:853"   # Cloudflare
+    - "tls://[2001:4860:4860::8888]:853"   # Google
+    - "tls://[2606:4700:4700::1001]:853"   # Cloudflare 备
+
+# 国内域名分流表（mosdns domain_set 文本，dnsctl geosite update 可更新）
+geosite_cn: /etc/antipole-dns/geosite_cn.txt
+
+# 广告/跟踪拦截（默认关）：命中返回 0.0.0.0 / ::
+blocklist:
+  enabled: false
+  file: /etc/antipole-dns/blocklist.txt
+
+# 监听
+listen:
+  local: "127.0.0.1:53"            # 本机 53
+  doh_inner: "127.0.0.1:8080"      # 内部 DoH（nginx-mtls 反代对外）
+  dot:
+    cert: /etc/letsencrypt/live/us-dns.2008828.xyz/fullchain.pem
+    key: /etc/letsencrypt/live/us-dns.2008828.xyz/privkey.pem
+    listens:                        # 对外 DoT/自定义端口，每条 [地址]:端口
+      - "[2a14:7583:ef30:ffff::2]:853"
+      - "[2a14:7583:ef30:ffff::2]:25353"
+      - "[2001:19f0:5400:2b78:5400:6ff:fe97:f349]:853"
+      - "[2001:19f0:5400:2b78:5400:6ff:fe97:f349]:25353"
+
+# WireGuard 内网 DNS（unbound，dns64），由 dnsctl 渲染 /etc/unbound/antipole.conf
+wg:
+  enabled: true
+  conf: /etc/unbound/antipole.conf
+  interface: fd00:1::1
+  dns64_prefix: "64:ff9b::/96"
+  upstreams:
+    - 2606:4700:4700::1111
+    - 2001:4860:4860::8888
+
+# 落盘目标
+paths:
+  mosdns_conf: /etc/mosdns/config.yaml

@@ -20,6 +20,9 @@ dist/certs/
 dist/*.json
 certs/
 
+# 服务器抽取备份（含私钥/密码文件，严禁入库）
+backups/
+
 # 日志与临时诊断脚本
 *.log
 _*.py

@@ -1,0 +1,7 @@
+.cn
++.cn
++.com.cn
++.net.cn
++.org.cn
++.gov.cn
++.edu.cn
