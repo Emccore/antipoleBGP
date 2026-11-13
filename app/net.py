@@ -813,7 +813,7 @@ async def warp_v4() -> str:
 
 async def bgp_status() -> dict:
     """探测 BGP 守护进程：bird/bird6/frr。尽力而为，缺工具也能跑。"""
-    info = {"daemons": [], "alive": False, "detail": ""}
+    info = {"daemons": [], "alive": False, "detail": "", "established": False}
     for proc_name in ("bird", "bird6", "bgpd", "zebra"):
         if await cmd("pgrep", "-x", proc_name, check=False):
             info["daemons"].append(proc_name)
@@ -823,13 +823,57 @@ async def bgp_status() -> dict:
             out = await cmd("birdc", "-s", "/run/bird/bird.ctl", "show",
                             "protocols", check=False, timeout=5)
             info["detail"] = out[:400]
+            # BGP 会话 Established 才代表前缀正在对外宣告
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "BGP":
+                    if "Established" in line:
+                        info["established"] = True
+                        break
         elif have_bin("vtysh"):
             out = await cmd("vtysh", "-c", "show bgp ipv6 summary",
                             check=False, timeout=5)
             info["detail"] = out[:400]
+            info["established"] = "Established" in out
     except Exception:
         info["detail"] = ""
     return info
+
+
+# 前缀保护态：BGP 会话中断后停止新建类操作（新隧道会话/轮换/证书签发），存量保持
+_prefix_down = False
+_bgp_ever_ok = False
+_bgp_fail_cnt = 0
+
+
+def prefix_down() -> bool:
+    return _prefix_down
+
+
+async def bgp_guard_loop():
+    """常驻检查 BGP 会话：中断达到阈值进入保护态，恢复即解除。无 BGP 组件时不启用。"""
+    global _prefix_down, _bgp_ever_ok, _bgp_fail_cnt
+    if not (have_bin("birdc") or have_bin("vtysh")):
+        print("[net] 无 birdc/vtysh，前缀保护不启用")
+        return
+    while True:
+        try:
+            st = await bgp_status()
+            if st["established"]:
+                _bgp_ever_ok = True
+                _bgp_fail_cnt = 0
+                if _prefix_down:
+                    _prefix_down = False
+                    print("[net] BGP 会话已恢复，解除保护态（恢复新建/轮换/签发）")
+            elif _bgp_ever_ok:
+                _bgp_fail_cnt += 1
+                if _bgp_fail_cnt >= 2 and not _prefix_down:
+                    _prefix_down = True
+                    print(f"[net] BGP 会话连续 {_bgp_fail_cnt} 次中断，进入保护态："
+                          f"暂停新建隧道会话/轮换/证书签发（存量连接保持）")
+        except Exception as e:
+            print(f"[net] BGP 检查异常: {e}")
+        await asyncio.sleep(30)
 
 
 # ---------- tc 限速 ----------
@@ -1190,6 +1234,8 @@ class Rotator:
         隧道用户例外：其静态地址被端口映射、证书校验与用户侧配置长期引用，
         换掉会让已建立的映射与已签发证书失配，因此直接拒绝。
         """
+        if prefix_down():
+            raise RuntimeError("BGP 会话中断（前缀未宣告），轮换已暂停")
         if core.get_tunnel_user(user["id"]):
             raise RuntimeError(
                 f"{user['name']} 为隧道用户，静态地址与账户绑定（用于端口映射与证书），不允许轮换")

@@ -357,9 +357,12 @@ setup_service() {
     #   notsent_lowat 128KB：避免发送队列在内核过度积压，降低排队延迟与内存；
     #   mtu_probing：PMTU 黑洞自动探测，避免大流量偶发卡死；
     #   slow_start_after_idle=0：间歇流量不重跑慢启动。
+    #   ip_nonlocal_bind=0：服务只能绑定真实存在的地址（配合地址守护）。
     cat > /etc/sysctl.d/99-antipole.conf <<EOF
 net.ipv6.conf.all.forwarding=1
 net.ipv4.conf.all.forwarding=1
+net.ipv6.ip_nonlocal_bind=0
+net.ipv4.ip_nonlocal_bind=0
 net.core.somaxconn=8192
 net.core.netdev_max_backlog=8192
 net.ipv4.tcp_max_syn_backlog=8192

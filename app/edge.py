@@ -1305,6 +1305,8 @@ class TunnelSession:
 
     async def _issue(self, acme: Path, domain: str):
         """执行签发：校验期间在用户静态地址的 80 端口临时提供校验文件。"""
+        if net.prefix_down():
+            raise RuntimeError("BGP 会话中断（前缀未宣告），证书签发已暂停")
         workdir = Path(tempfile.mkdtemp(prefix="antipole-cert-"))
         webroot = Path(_x().get("acme_webroot", "/etc/antipole/acme-webroot"))
         challenge = webroot / ".well-known" / "acme-challenge"
@@ -1866,9 +1868,7 @@ class ControlProtocol(asyncio.Protocol):
         token = token.strip()
         old = _sessions.get(token)
         if old is not None:
-            # 同一账号只允许一条会话。旧会话若已无保活，说明客户端已死或链路已断，
-            # 此时直接顶替（并把旧连接关掉，让失联的旧客户端别再重连）；
-            # 旧会话仍在正常保活则拒绝，避免两个活客户端互相顶来顶去造成抖动。
+            # 单账号单会话：旧会话失联（超时无保活）即接管；存活则拒绝新会话。
             if time.monotonic() - old._last_active <= _TAKEOVER_AFTER_S:
                 self.reject("duplicate")
                 return
@@ -1889,6 +1889,9 @@ class ControlProtocol(asyncio.Protocol):
             return
         if GUARD is not None and GUARD.is_protected(user):
             self.reject("protected")
+            return
+        if net.prefix_down():
+            self.reject("busy")
             return
         session = TunnelSession(user, self.transport, direct=direct and _relay_ready())
         self.session = session

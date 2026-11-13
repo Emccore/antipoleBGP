@@ -205,6 +205,7 @@ async def run(cfg):
     spawn(webmod.abuse_sweep_loop())
     spawn(db_backup_loop(cfg["db"]["path"]))
     spawn(edge.tunnel_start())
+    spawn(net.bgp_guard_loop())
     if cfg["warp"]["enabled"]:
         spawn(net.warp_health_loop(cfg))
 
