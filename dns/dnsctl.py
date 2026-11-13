@@ -625,6 +625,29 @@ def cmd_guard(args, cfg):
     print("  ✓ " + (r.stdout.strip().splitlines()[-1] if r.stdout else "规则已写入"))
     r = sh("ufw status | grep '53/udp'")
     print("  " + "\n  ".join(r.stdout.strip().splitlines()))
+    print("▸ DoT/DoH 端口限速（每来源 IP，防公开递归资源滥用）")
+    rl4 = ("-A ufw-before-input -p tcp -m multiport --dports 853,25353,11451"
+           " -m conntrack --ctstate NEW -m hashlimit --hashlimit-above 30/second"
+           " --hashlimit-burst 60 --hashlimit-mode srcip --hashlimit-srcmask 32"
+           " --hashlimit-name antipole_dns -j DROP\n\n")
+    rl6 = ("-A ufw6-before-input -p tcp -m multiport --dports 853,25353,11451"
+           " -m conntrack --ctstate NEW -m connlimit --connlimit-above 40"
+           " --connlimit-mask 128 -j DROP\n\n")
+    dirty = False
+    for path, rule, tag in [("/etc/ufw/before.rules", rl4, "antipole_dns"),
+                            ("/etc/ufw/before6.rules", rl6, "connlimit")]:
+        t = open(path, encoding="utf-8").read()
+        if tag in t:
+            print(f"  ✓ {path} 已有限速规则")
+            continue
+        shutil.copy2(path, path + ".bak-guard")
+        marker = "# don't delete the 'COMMIT' line"
+        open(path, "w", encoding="utf-8").write(t.replace(marker, rule + marker, 1))
+        dirty = True
+        print(f"  ✓ {path} 已写入限速规则")
+    if dirty:
+        sh("ufw reload")
+        print("  ✓ ufw 已重载")
     return 1 if bad else 0
 
 
