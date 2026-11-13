@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 # antipole-dns · DNS 网关管理程序（dnsctl）
 #
-# 把「mosdns 分流递归 + unbound(WG dns64) + 证书/防火墙/监听」整套 DNS 系统统一成
-# 一个可管理的程序：配置即代码（dns.yaml → 渲染 mosdns/unbound 配置），带拨测自检、
-# 广告拦截、分流表更新与热重载。渲染出的配置与手工调优版逐字兼容，可无缝接管现网。
+# 将「mosdns 分流递归 + unbound(WG dns64) + 证书/防火墙/监听」整套 DNS 服务统一为
+# 单一管理程序：配置即代码（dns.yaml → 渲染 mosdns/unbound 配置），提供拨测自检、
+# 广告拦截、分流表更新与热重载。渲染结果与既有生产配置语义兼容，可平滑接管现网。
 #
 #   dnsctl render [-c 配置] [-o 目录]          渲染配置（落盘前预览，目录缺省=打印 diff）
-#   dnsctl apply  [-c 配置] [--restart]        备份旧配置 → 落盘 → 热重载（--restart 整重启）
+#   dnsctl apply  [-c 配置] [--restart]        备份旧配置 → 落盘 → 热重载（--restart 整体重启）
 #   dnsctl doctor                              全面自检：服务/端口/证书/上游拨测/样例解析
 #   dnsctl test <域名> [A|AAAA] [--udp a:p|--dot a:p]   手动查询（默认本机 53）
 #   dnsctl status                              服务与监听一览
 #   dnsctl geosite update [--url] [--no-reload]  更新国内分流表（Loyalsoldier direct-list）
 #   dnsctl blocklist update [--url] [--enable]   更新广告拦截表（StevenBlack hosts）
+#   dnsctl addr switch <旧地址> <新地址>       切换 DoT/DoH/mTLS 接入地址
+#   dnsctl domain switch <新域名>              切换服务域名（自动重新签发证书）
+#   dnsctl guard                               反滥用加固：限制 53/udp 仅内网可达
 #   dnsctl version                             版本信息
 #
 # 依赖：python3 + PyYAML（apt install python3-yaml）；其余仅标准库。
@@ -74,7 +77,7 @@ def render_mosdns(cfg):
     A(f"  level: {cfg.get('general', {}).get('log_level', 'info')}")
     A("")
     A("plugins:")
-    A("  # 国内域名匹配器：必须是 domain_set 类型插件，qname 匹配器才能引用它")
+    A("  # 国内域名匹配器：须为 domain_set 类型插件，qname 匹配器方可引用")
     A("  - tag: geosite_cn")
     A("    type: domain_set")
     A("    args:")
@@ -82,7 +85,7 @@ def render_mosdns(cfg):
     A(f"        - {_q(cfg.get('geosite_cn', ''))}")
     A("")
     if bl.get("enabled"):
-        A("  # 广告/跟踪拦截：命中直接回空记录")
+        A("  # 广告与跟踪域名拦截：命中返回空记录")
         A("  - tag: black_hole")
         A("    type: black_hole")
         A("    args:")
@@ -94,14 +97,14 @@ def render_mosdns(cfg):
         A("      files:")
         A(f"        - {_q(bl.get('file', ''))}")
         A("")
-    A("  # 缓存：加速重复查询，lazy 模式")
+    A("  # 缓存：重复查询加速，启用 lazy 过期策略")
     A("  - tag: cache")
     A("    type: cache")
     A("    args:")
     A(f"      size: {cache.get('size', 20480)}")
     A(f"      lazy_cache_ttl: {cache.get('lazy_ttl', 86400)}")
     A("")
-    A("  # 国内上游：明文 UDP，快；多路上游 + 并发，掉一个自动用剩余的")
+    A("  # 国内上游：明文 UDP 低延迟；多路并发，单点故障自动切换")
     A("  - tag: forward_local")
     A("    type: forward")
     A("    args:")
@@ -110,7 +113,7 @@ def render_mosdns(cfg):
     for u in dom:
         A(f"        - addr: {_q(u)}")
     A("")
-    A("  # 国外上游：多路加密 DoT，主连不上自动切下一个")
+    A("  # 国外上游：多路加密 DoT，故障自动切换")
     A("  - tag: forward_remote")
     A("    type: forward")
     A("    args:")
@@ -121,7 +124,7 @@ def render_mosdns(cfg):
         if u.startswith("tls://"):
             A("          enable_pipeline: true")
     A("")
-    A("  # 主逻辑：先查缓存；拦截表命中回空；命中国内域名走国内，其余走国外加密")
+    A("  # 解析主流程：缓存查询 → 拦截表 → 国别分流（国内容明文，其余走加密出口）")
     A("  - tag: main_sequence")
     A("    type: sequence")
     A("    args:")
@@ -134,7 +137,7 @@ def render_mosdns(cfg):
     A("      - exec: $forward_remote")
     A("")
     local = lis.get("local", "127.0.0.1:53")
-    A("  # 本地 53：只给本机解析用，不对外")
+    A("  # 本地 53：仅服务本机进程，不对外暴露")
     A("  - tag: udp_local")
     A("    type: udp_server")
     A("    args:")
@@ -146,7 +149,7 @@ def render_mosdns(cfg):
     A("      entry: main_sequence")
     A(f"      listen: {_q(local)}")
     A("")
-    A("  # DoT：手机\"私人 DNS\"固定走 853；另保留自定义端口备用（大陆 DPI 可能干扰 853）。")
+    A("  # DoT：移动端\"私人 DNS\"固定使用 853；备用端口规避针对 853 端口的网络干扰。")
     for i, addr in enumerate(dot.get("listens", [])):
         tag = "dot_server" if i == 0 else f"dot_server_{i}"
         A(f"  - tag: {tag}")
@@ -159,8 +162,8 @@ def render_mosdns(cfg):
     A("")
     doh = lis.get("doh_inner", "")
     if doh:
-        A("  # DoH：内部明文端点，只给本机 nginx 反代用，不直接对外。")
-        A("  # 注意：v5.3 http_server 用 entries[]（path+exec），不是 entry/path。")
+        A("  # DoH：内部端点，经由本机反向代理对外发布，不直接暴露。")
+        A("  # v5.3 的 http_server 采用 entries[]（path+exec）结构，而非 entry/path。")
         A("  - tag: doh_inner")
         A("    type: http_server")
         A("    args:")
@@ -195,7 +198,7 @@ def render_unbound(cfg):
 
 
 def render(cfg):
-    """返回 [(路径, 内容), ...]；wg 未启用时只返回 mosdns 一份。"""
+    """返回 [(路径, 内容), ...]；wg 未启用时仅返回 mosdns 配置。"""
     out = [(cfg.get("paths", {}).get("mosdns_conf", "/etc/mosdns/config.yaml"),
             render_mosdns(cfg))]
     wg = cfg.get("wg", {})
@@ -273,7 +276,7 @@ def do_apply(cfg, restart=False, yes=False):
             print("· unbound 未运行（由 antipole 服务按需拉起）")
 
 
-# ---------------- 裸 DNS 拨测（无第三方依赖） ----------------
+# ---------------- DNS 探测模块（仅依赖标准库） ----------------
 
 def build_query(name, qtype):
     tid = random.getrandbits(16)
@@ -355,7 +358,7 @@ def query_tcp(server, name, qtype=1, timeout=QUERY_TIMEOUT, tls=False):
         if tls:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE          # 拨测只验可达与可解析
+            ctx.verify_mode = ssl.CERT_NONE          # 探测仅验证可达性与解析能力，不校验证书链
             s = ctx.wrap_socket(raw)
         else:
             s = raw
@@ -520,13 +523,13 @@ def cmd_test(args, cfg):
     return 0 if ips else 2
 
 
-# ---------------- 换地址 / 换域名 / 反滥用 ----------------
+# ---------------- 地址与域名切换 / 反滥用加固 ----------------
 
 NGINX_MTLS_CONF = "/etc/nginx-mtls/nginx.conf"
 
 
 def _sub_tree(root, old, new, globs=()):
-    """替换 root 下（含 glob 追加）文本文件中的 old→new，返回改动文件清单。"""
+    """在 root 及 glob 列表命中的文本文件中执行 old→new 替换，返回改动文件清单。"""
     files = []
     for p in [root] + [f for g in globs for f in __import__("glob").glob(g)]:
         if not os.path.isfile(p) or os.path.islink(p):
@@ -553,7 +556,7 @@ def _reload_all():
 
 
 def cmd_addr(args, cfg):
-    """addr switch <旧地址> <新地址>：换 DoT/DoH/mTLS 接入地址（证书与域名不受影响）。"""
+    """addr switch <旧地址> <新地址>：切换 DoT/DoH/mTLS 接入地址（证书与域名不受影响）。"""
     old, new = args.old.strip("[]"), args.new.strip("[]")
     if old == new:
         return
@@ -568,11 +571,11 @@ def cmd_addr(args, cfg):
     sh("ufw allow proto tcp from any to any port 853,25353,11451,80 2>/dev/null || true")
     cfg2 = load_config(args.config)
     do_apply(cfg2, restart=True, yes=True)
-    print(f"\n完成。请把相关域名 AAAA 记录改指 [{new}]（Cloudflare 控制台）。")
+    print(f"\n完成。请将相关域名 AAAA 记录更新为 [{new}]（Cloudflare 控制台）。")
 
 
 def cmd_domain(args, cfg):
-    """domain switch <新域名>：重签证书+换 server_name（新域名 AAAA 需已指向本服务器）。"""
+    """domain switch <新域名>：重新签发证书并更新 server_name（新域名 AAAA 须已解析至本服务器）。"""
     dom = args.domain
     dot = cfg.get("listen", {}).get("dot", {})
     cert = dot.get("cert", "")
@@ -582,10 +585,10 @@ def cmd_domain(args, cfg):
         old = old.split("CN =")[-1].strip()
     except Exception:
         sys.exit("无法从现有证书读取当前域名")
-    print(f"换域名：{old} → {dom}")
+    print(f"域名切换：{old} → {dom}")
     r = sh(f"/root/.acme.sh/acme.sh --issue -d {dom} -w /var/www/acme --keylength ec-256 --server letsencrypt")
     if r.returncode != 0:
-        print(r.stdout[-500:]); sys.exit("签发失败：确认新域名 AAAA 已指向本服务器（80 已自动可达）")
+        print(r.stdout[-500:]); sys.exit("签发失败：请确认新域名 AAAA 记录已解析至本服务器（80 端口验证入口已就绪）")
     d = f"/etc/antipole-dns/cert/{dom}"
     os.makedirs(d, exist_ok=True)
     r = sh(f"/root/.acme.sh/acme.sh --install-cert -d {dom} --ecc "
@@ -600,11 +603,11 @@ def cmd_domain(args, cfg):
         NGINX_MTLS_CONF, old, dom, globs=["/etc/nginx-mtls/stream.d/*.conf"])
     print("nginx 引用已替换：" + (", ".join(dict.fromkeys(changed)) or "（无）"))
     do_apply(load_config(args.config), restart=True, yes=True)
-    print(f"\n完成。请把 DNS 记录改指新域名 {dom}。旧证书保留在 /root/.acme.sh/。")
+    print(f"\n完成。请将 DNS 记录切换至新域名 {dom}。旧证书保留于 /root/.acme.sh/。")
 
 
 def cmd_guard(args, cfg):
-    """反滥用兜底：对外 53/udp 显式拒绝（防 DNS 反射放大），WG 内网放行。"""
+    """反滥用加固：53/udp 仅允许内网网段，显式拒绝其余来源（防范 DNS 反射放大）。"""
     print("▸ 对外 53/udp 监听检查")
     out = sh("ss -lunp | grep ':53 '").stdout
     bad = [l for l in out.splitlines()
@@ -615,7 +618,7 @@ def cmd_guard(args, cfg):
             print("    " + l)
     else:
         print("  ✓ 仅本机/WG 内网监听，无反射风险")
-    print("▸ 防火墙兜底（先放行 WG 内网，末尾拒绝其余 53/udp）")
+    print("▸ 防火墙规则（前段放行 WG 内网网段，末段拒绝其余来源的 53/udp）")
     sh("ufw allow from fd00:1::/64 to any port 53 proto udp")
     sh("ufw allow from 10.7.0.0/24 to any port 53 proto udp")
     r = sh("ufw deny proto udp from any to any port 53")
@@ -634,7 +637,7 @@ def _fetch(url):
 
 
 def _to_mosdns_domainset(text):
-    """v2ray/hosts 列表 → mosdns domain_set 文本。"""
+    """将 v2ray/hosts 格式域名列表转换为 mosdns domain_set 文本格式。"""
     lines = []
     for raw in text.splitlines():
         s = raw.strip()

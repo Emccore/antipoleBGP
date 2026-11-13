@@ -55,7 +55,7 @@ wg:                                 # unbound（WireGuard 内网 dns64）
   dns64_prefix: "64:ff9b::/96"
 ```
 
-分流逻辑（main_sequence）：**缓存 → 拦截表命中回空（可选）→ 国内域名走国内上游 → 其余走国外 DoT**。
+分流逻辑（main_sequence）：**缓存查询 → 拦截表命中返回空记录（可选）→ 国内域名经国内上游 → 其余经国外加密 DoT**。
 
 ## 安装
 

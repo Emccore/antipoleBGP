@@ -1,17 +1,17 @@
-# antipole-dns 配置 · dnsctl render/apply 按此生成 mosdns 与 unbound 配置
-# 所有默认值即现网行为；改动后 dnsctl apply 落盘并热重载
+# antipole-dns 配置 · dnsctl render/apply 依据本文件生成 mosdns 与 unbound 配置
+# 默认值对应现网行为；修改后执行 dnsctl apply 落盘并热重载
 
 general:
   log_level: info
 
-# 缓存：size 条目上限；lazy_ttl 秒内过期记录仍可答（后台刷新）
+# 缓存：size 为条目上限；lazy_ttl 秒内过期记录仍可应答（后台异步刷新）
 cache:
   size: 20480
   lazy_ttl: 86400
 
 # 上游
-# domestic：国内明文 UDP（快），多路并发，掉一个自动用剩余
-# foreign ：国外加密 DoT（默认 853），并发竞速
+# domestic：国内明文 UDP 低延迟，多路并发，单点故障自动切换
+# foreign ：国外加密 DoT（默认 853），多路并发竞速
 upstreams:
   domestic:
     - "2400:3200::1"        # 阿里
@@ -24,7 +24,7 @@ upstreams:
 # 国内域名分流表（mosdns domain_set 文本，dnsctl geosite update 可更新）
 geosite_cn: /etc/antipole-dns/geosite_cn.txt
 
-# 广告/跟踪拦截（默认关）：命中返回 0.0.0.0 / ::
+# 广告与跟踪域名拦截（默认关闭）：命中返回 0.0.0.0 / ::
 blocklist:
   enabled: false
   file: /etc/antipole-dns/blocklist.txt
@@ -36,7 +36,7 @@ listen:
   dot:
     cert: /etc/letsencrypt/live/us-dns.2008828.xyz/fullchain.pem
     key: /etc/letsencrypt/live/us-dns.2008828.xyz/privkey.pem
-    listens:                        # 对外 DoT/自定义端口，每条 [地址]:端口
+    listens:                        # 对外 DoT 及备用端口，每条格式 [地址]:端口
       - "[2a14:7583:ef30:ffff::2]:853"
       - "[2a14:7583:ef30:ffff::2]:25353"
       - "[2001:19f0:5400:2b78:5400:6ff:fe97:f349]:853"

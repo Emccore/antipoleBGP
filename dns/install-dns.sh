@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # antipole-dns · 一键安装（Linux 服务器）
 #
-# 联网安装（仓库 raw）：
+# 联网安装（仓库 raw 地址）：
 #   curl -fsSL https://raw.githubusercontent.com/Emccore/antipoleBGP/main/dns/install-dns.sh | sudo bash
 # 源码目录内安装：
 #   sudo bash dns/install-dns.sh
 # 卸载：
 #   sudo bash dns/install-dns.sh --uninstall
 #
-# 做什么：
-#   1. 安装 python3 / python3-yaml / unzip
+# 安装内容：
+#   1. 安装依赖 python3 / python3-yaml / unzip
 #   2. 安装 mosdns v5.3.1 二进制（已存在则跳过）
 #   3. 部署 dnsctl → /usr/local/bin/dnsctl，配置 → /etc/antipole-dns/
 #   4. 写入 mosdns systemd 单元（与现网一致），渲染配置并落盘
-#   5. 首次 geosite 初始表 → dnsctl doctor 全量自检
-# 不动的东西：现有 /etc/mosdns/config.yaml 会先备份；unbound/证书/nginx 一概不碰。
+#   5. 写入初始分流表 → dnsctl doctor 全量自检
+# 影响范围：现有 /etc/mosdns/config.yaml 先备份后覆盖；unbound/证书/nginx 不做变更。
 set -euo pipefail
 
 RAW=${ANTIPOLE_RAW:-https://raw.githubusercontent.com/Emccore/antipoleBGP/main}
@@ -136,7 +136,7 @@ step "渲染配置并落盘"
 "$BIN" -c "$DIR/dns.yaml" apply -y --restart || warn "apply 未全部成功（证书路径等按需修改 dns.yaml）"
 
 step "自检"
-"$BIN" -c "$DIR/dns.yaml" doctor || warn "doctor 有告警，逐项排查后重跑：dnsctl doctor"
+"$BIN" -c "$DIR/dns.yaml" doctor || warn "自检存在告警，逐项处理后重跑：dnsctl doctor"
 
 printf '\n'
 ok "antipole-dns 安装完成"
