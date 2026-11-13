@@ -809,7 +809,7 @@ async def warp_v4() -> str:
     return ""
 
 
-# ---------- BGP 状态（只监控联动，不瞎动） ----------
+# ---------- BGP 状态（仅监控联动，不做变更） ----------
 
 async def bgp_status() -> dict:
     """探测 BGP 守护进程：bird/bird6/frr。尽力而为，缺工具也能跑。"""
@@ -1016,7 +1016,7 @@ async def dns64_setup():
     await cmd("ip", "-4", "route", "replace", d64["v4_net"], "dev", d64["iface"],
               check=False)
 
-    # NAT64 池出公网做 SNAT（WARP 通着就借道 wg-warp，否则走原生 v4 出口）
+    # NAT64 池出公网做 SNAT（WARP 可用时经 wg-warp 转发，否则使用原生 v4 出口）
     await _n64_snat()
 
     # sysctl

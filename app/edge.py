@@ -1360,7 +1360,7 @@ class TunnelSession:
             env = {"HOME": "/root", "PATH": os.environ.get("PATH", "/usr/sbin:/usr/bin:"
                                                            "/sbin:/bin")}
             # webroot 模式：校验文件由上面这个本机 80 端口服务提供，acme.sh 只负责
-            # 写文件与走 ACME。不能加 --standalone（会与本题监听抢 80 端口），
+            # 写文件并调用 ACME。不可加 --standalone（将与该监听争用 80 端口），
             # 也不能写裸 --log（该参数需要一个值，会把后一个参数吞掉导致解析失败）。
             out = await asyncio.create_subprocess_exec(
                 str(acme), "--issue", "-d", domain, "-w", str(webroot),
@@ -1411,7 +1411,7 @@ class TunnelSession:
         """
         if local_port in self.maps:
             return local_port, ""                  # 重复声明视为幂等成功
-        # 先过保护闸：特权端口与主机自身占用的端口一律不放开，避免用户占走主机服务端口
+        # 先过保护闸：特权端口与主机自身占用的端口一律不开放，避免用户占用主机服务端口
         denied = await port_denied(local_port)
         if denied:
             core.log_abuse("tunnel_bind", self.name, f"端口 {local_port} 被拒绝：{denied}")

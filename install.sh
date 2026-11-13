@@ -242,7 +242,7 @@ install_py_deps() {
         || die "Python 依赖安装失败（aiohttp/pyyaml），请检查网络与 pip 源"
     python3 -c "import aiohttp, yaml" 2>/dev/null \
         || die "Python 依赖导入校验失败"
-    # uvloop 是可选加速：装不上就用标准事件循环，不影响功能
+    # uvloop 为可选加速：安装失败时回退标准事件循环，不影响功能
     python3 -m pip install --break-system-packages uvloop >/dev/null 2>&1 \
         || python3 -m pip install uvloop >/dev/null 2>&1 \
         || echo "    uvloop 未安装（将使用标准事件循环，不影响功能）"
@@ -354,7 +354,7 @@ setup_service() {
     #   队列：somaxconn/backlog/syn_backlog 8192，承接数万并发新建；
     #   缓冲：rmem/wmem 上限 64MB，交给内核自适应升档（长肥管道必需）；
     #   拥塞：BBR + fq，弱网高延迟链路吞吐远优于 cubic；
-    #   notsent_lowat 128KB：发送队列别在内核里囤积，降低排队延迟与内存；
+    #   notsent_lowat 128KB：避免发送队列在内核过度积压，降低排队延迟与内存；
     #   mtu_probing：PMTU 黑洞自动探测，避免大流量偶发卡死；
     #   slow_start_after_idle=0：间歇流量不重跑慢启动。
     cat > /etc/sysctl.d/99-antipole.conf <<EOF
@@ -388,7 +388,7 @@ Type=simple
 User=root
 WorkingDirectory=$APP_DIR
 Environment=PYTHONUNBUFFERED=1
-# 转发是内存拷贝密集型：抑制 glibc 归还堆，缺页率可降一个量级（1 核小机收益明显）
+# 转发为内存拷贝密集型：抑制 glibc 归还堆，缺页率可降低一个数量级（单核环境收益显著）
 Environment=MALLOC_TRIM_THRESHOLD_=-1
 Environment=MALLOC_MMAP_THRESHOLD_=134217728
 Environment=MALLOC_TOP_PAD_=33554432

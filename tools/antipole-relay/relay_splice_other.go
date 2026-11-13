@@ -11,7 +11,7 @@ type rawConnConn interface {
 	SyscallConn() (syscall.RawConn, error)
 }
 
-// splicePump 非 Linux 无实现：调用方由 spliceSupported 把关，永不到达
+// splicePump 非 Linux 无实现：调用方由 spliceSupported 守卫，此路径不可达
 func splicePump(src, dst rawConnConn) (int64, error) {
 	return 0, syscall.ENOTSUP
 }

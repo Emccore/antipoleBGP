@@ -213,7 +213,7 @@ def run_gui():
     def append_log(line: str):
         log_box.configure(state="normal")
         log_box.insert("end", line + "\n")
-        # 自动清理：只保留最近 LOG_KEEP 行（海量连接下日志不刷爆界面/内存）
+        # 自动清理：仅保留最近 LOG_KEEP 行（海量连接下避免界面与内存过载）
         total = int(log_box.index("end-1c").split(".")[0])
         if total > LOG_KEEP:
             log_box.delete("1.0", f"{total - LOG_KEEP}.0")

@@ -50,7 +50,7 @@ const (
 	// 型流量（大块）时自动放大到 4 倍，小块交互流量立即回落到基准。
 	// 缓冲区策略：空闲/交互连接每方向只常驻 4KB；检测到持续积压（连续两次读满）
 	// 才从池里借 256KB 大缓冲，块回落即归还——数万并发连接时内存不随连接数
-	// 线性膨胀，吞吐型流量仍拿得到大块。
+	// 线性膨胀，吞吐型流量仍可获得大块。
 	copyBufIdle           = 4 << 10
 	copyBufMax            = 256 << 10
 	coalesceBurstFloor    = 4 << 10  // 小于此值视为交互型流量
@@ -71,7 +71,7 @@ var bulkPause = 4 * time.Millisecond
 
 // spliceEnable splice 零拷贝开关（-splice）。默认关闭：实测 5MB/s 级 WAN
 // 瓶颈链路上 splice 反而 20ms/MB（排空速率受限，1MB 管道填不满，模式碎片化
-// + poller 挂起/唤醒次数暴涨）；read+自适应攒批在同链路 5.0 ms/MB 最优。
+// + poller 挂起/唤醒次数显著增加）；read+自适应攒批在同链路 5.0 ms/MB 最优。
 // 回环/内网等高吞吐场景可开 -splice=true（数据不过用户态）。
 var spliceEnable = false
 

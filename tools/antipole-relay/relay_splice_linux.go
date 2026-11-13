@@ -1,8 +1,8 @@
 //go:build linux
 
 // 内核态零拷贝搬运：splice 把数据从源 socket 直接送进目标 socket，
-// 全程不经过用户态（省 2 次内存拷贝）。V3.6 曾试过 splice 但失败，
-// 原因是不攒批——每次 splice 只拿到 ~3KB，系统调用次数反而暴涨。
+// 全程不经过用户态（节省 2 次内存拷贝）。V3.6 曾尝试 splice 但未达预期，
+// 原因是未做攒批——每次 splice 仅获取约 3KB，系统调用次数反而显著增加。
 // 本版做法：
 //   - 只在「有积压」时切入（上次 read 满 256KB 才算有积压），平时仍走
 //     read/write 循环，交互流量零影响；
@@ -43,7 +43,7 @@ var splicePipePool = sync.Pool{New: func() any {
 		return nil // 分配失败：Get 得到 nil，调用方回退 read/write
 	}
 	p := &splicePipe{r: fds[0], w: fds[1]}
-	// 扩容失败不致命：默认 64KB 也能跑，只是系统调用多一点
+	// 扩容失败不影响正确性：默认 64KB 容量仍可工作，仅系统调用次数增多
 	_, _, _ = syscall.Syscall(syscall.SYS_FCNTL,
 		uintptr(p.w), fcntlSetPipeSz, pipeCap)
 	return p
@@ -66,9 +66,9 @@ func putSplicePipe(p *splicePipe) {
 // 返回搬运字节数与错误；EOF 以 io.EOF 语义返回，与 read 循环一致。
 // 限速不走此路径（调用方保证 limiter.rate<=0）。
 //
-// 死锁要点：填循环遇到 EAGAIN 必须**立即返回去排空**，绝不能挂在 poller 等
+// 死锁要点：填循环遇到 EAGAIN 必须**立即返回执行排空**，绝不能挂载 poller 等待
 // 源数据——否则"管道没填满→不排空→不读源→源侧窗口满不发→永远填不满"
-// 互等死锁。排空阶段挂 poller 等可写是安全的（dst 可写只依赖对端消费）。
+// 形成互等死锁。排空阶段挂载 poller 等待可写是安全的（dst 可写仅依赖对端消费）。
 func splicePump(src, dst rawConnConn) (int64, error) {
 	sp := getSplicePipe()
 	if sp == nil {
@@ -93,9 +93,9 @@ func splicePump(src, dst rawConnConn) (int64, error) {
 	var total int64
 	eof := false
 	for !eof {
-		// 填：socket→pipe。首把（管道空）允许挂 poller 等可读——此刻
+		// 填：socket→pipe。首次循环（管道空）允许挂载 poller 等待可读——此刻
 		// socket 缓冲已搬空、接收窗口打开，上游可发，不存在互等；
-		// 非首把（管道有数据）EAGAIN 必须立即返回去排空，否则管道占着
+		// 非首次循环（管道有数据）EAGAIN 必须立即返回排空，否则管道被占用
 		// 不放会把接收窗口耗成 0，与上游互等死锁。
 		filled := 0
 		first := true
@@ -106,7 +106,7 @@ func splicePump(src, dst rawConnConn) (int64, error) {
 				n, serr = syscall.Splice(int(sfd), nil, sp.w, nil,
 					pipeCap-filled, spliceMove|spliceNonblock)
 				if serr == syscall.EAGAIN {
-					return !first // 管道空才允许挂等；有数据立即去排空
+					return !first // 管道空才允许挂载等待；有数据立即转排空
 				}
 				return true
 			}); err != nil {
@@ -122,11 +122,11 @@ func splicePump(src, dst rawConnConn) (int64, error) {
 			}
 			filled += int(n)
 			if serr == syscall.EAGAIN {
-				break // 源暂时取空：先把手头的排空
+				break // 源暂时取空：先排空已搬运数据
 			}
 		}
 
-		// 排空：pipe→dst。挂 poller 等可写是安全的（dst 可写只依赖对端消费）。
+		// 排空：pipe→dst。挂载 poller 等待可写是安全的（dst 可写仅依赖对端消费）。
 		drained := 0
 		for drained < filled {
 			var n int64

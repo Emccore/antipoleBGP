@@ -68,7 +68,7 @@ CHUNK = 262144             # 单次搬运字节：大块读取可显著摊薄每
 PIPE_CHUNK = 65536         # 直连通道起步缓冲：空闲/交互连接的常驻内存档
 PIPE_CHUNK_MAX = 262144    # 持续读满（下游有积压）时的加倍上限：块越大每 MB 系统调用越少
 # TLS 包裹为可选能力：默认走明文 TCP（服务端 tunnel.sni/cert/key 与客户端 --sni
-# 同时配置才启用加密），避免证书/域名细节把普通客户端挡在门外
+# 同时配置才启用加密），避免证书/域名配置抬高使用门槛
 DEFAULT_SNI = ""
 
 
@@ -135,7 +135,7 @@ def ssl_context(opt):
 
 # SLA 目标下的链路参数：心跳与探测都要「快发现、快恢复」。
 # 中间设备（家用 NAT/运营商防火墙）的 TCP 表项普遍 30~60s 就回收，
-# 应用层心跳必须比它更密；内核 keepalive 各平台默认动辄 2 小时，必须显式设。
+# 应用层心跳必须比其更密；内核 keepalive 各平台默认普遍长达 2 小时，须显式设定。
 PING_INTERVAL = 15          # 应用层心跳（秒）：密到足以保住 NAT 表项、疏到不构成流量
 KA_IDLE = 10                # 内核 keepalive 空闲多久后开始探测（秒）
 KA_INTVL = 3                # 探测间隔（秒）
@@ -338,7 +338,7 @@ class TunnelClient:
                 print(f"映射就绪：公网 [{self.ip6}]:{public_port}"
                       f"  ==  本机 {local_ip}:{local_port}")
             elif resp.startswith("ERRP"):
-                # 服务端会带上失败原因（如端口被服务器自身服务占用），直接透出更省事
+                # 服务端会附带失败原因（如端口被服务器自身服务占用），直接透出以便定位
                 parts = resp.split(" ", 2)
                 why = parts[2].strip() if len(parts) > 2 and parts[2].strip() \
                     else "端口被占用或静态地址未就绪"
@@ -730,7 +730,7 @@ class TunnelClient:
         while not self._stopping:
             await asyncio.sleep(self.opt.ping)
             # 假活检测：链路被中间设备静默丢弃时，写 PING 往往仍“成功”，
-            # 只是再也收不到 PONG；两个周期没有任何下行即判定断开并重连
+            # 且无法收到 PONG；两个周期内无任何下行即判定断开并重连
             if time.monotonic() - self._last_recv > self.opt.ping * 2 + 5:
                 print("保活无响应，判定链路已失效，断开重连")
                 self.writer.close()
@@ -849,7 +849,7 @@ async def request_cert(opt) -> int:
 async def run(opt):
     # SLA 策略：闪断（网络抖动、NAT 表项回收）用 1s/2s/3s 快速重试把恢复时间压到
     # 秒级；连续快速重试仍失败说明是较长的故障，转入指数退避（retry 起步、30s 封顶）
-    # 避免打爆服务端。SLA 统计跨所有重连共享，状态行里持续可见。
+    # 避免服务端过载。SLA 统计跨所有重连共享，状态行持续可见。
     base = max(1, opt.retry)
     sla = SlaStats()
     sla.up_since = time.monotonic()
@@ -871,7 +871,7 @@ async def run(opt):
             await client.loop()
             print("连接已断开")
         except DuplicateSession:
-            # 重连无意义：账号被另一条会话占着，退避重试只会刷屏
+            # 重连无意义：账号被另一条会话占用，退避重试仅产生无效日志
             print("该账号已有一条在用会话（另一台设备或残留进程正在连接）。")
             print("同一账号同一时间只允许一条隧道：请先停掉对方，"
                   "或等旧会话约 3 分钟无保活后重试。")
