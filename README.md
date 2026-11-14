@@ -231,6 +231,16 @@ antipole log -n 50                  # 最近日志
 antipole version                    # 版本信息
 ```
 
+DNS 网关管理已并入同一入口（透传至 dnsctl，命令详见 7.8 与 `dns/README.md`）：
+
+```bash
+antipole dns status                 # DNS 服务状态与监听
+antipole dns doctor                 # 全面自检（上游拨测/证书/端到端解析）
+antipole dns cert renew             # 手动重签 DNS 服务证书
+antipole dns cert password          # 查看 mTLS 客户端证书导入密码
+antipole dns guard                  # 反滥用加固（53/udp 仅内网 + 端口限速）
+```
+
 `antipole status` 除组件状态外，输出全部用户的活动地址健康状态：
 
 ```

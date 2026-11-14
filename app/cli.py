@@ -10,7 +10,9 @@
 """
 import argparse
 import asyncio
+import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -884,12 +886,32 @@ antipoleBGP 出口调度管理系统 V3.20 管理命令
     antipole cert list                 证书列表
     antipole cert reload [--silent]    热载 Xray
 
+  DNS 网关（转发至 dnsctl）
+    antipole dns status | doctor       DNS 服务状态 / 全面自检
+    antipole dns test <域名> [--udp|--dot 地址]   手动查询
+    antipole dns apply / render        配置落盘 / 预览
+    antipole dns geosite update        更新国内分流表
+    antipole dns blocklist update      更新广告拦截表
+    antipole dns addr|domain switch    切换接入地址 / 追加域名
+    antipole dns cert renew|password   手动重签证书 / 查看 mTLS 密码
+    antipole dns guard                 反滥用加固（防 DNS 反射）
+
   其他
     antipole invite [--count N]        生成邀请码
     antipole backup                    手动备份数据库
 
 除查询类外，所有修改配置的命令会自动触发热载，不重启、不中断连接。
 """
+
+
+async def cmd_dns(cfg, args):
+    """DNS 网关管理：透传至 dnsctl（antipole dns <status|doctor|test|apply|...>）。"""
+    exe = shutil.which("dnsctl") or "/usr/local/bin/dnsctl"
+    if not os.path.exists(exe):
+        print("dnsctl 未安装：先部署 antipole-dns（bash dns/install-dns.sh）")
+        return 1
+    r = subprocess.run([exe] + (args.rest or []))
+    sys.exit(r.returncode)
 
 
 async def cmd_help(cfg, args):
@@ -1002,6 +1024,10 @@ def build_parser() -> argparse.ArgumentParser:
     node = sub.add_parser("log", help="最近日志")
     node.add_argument("-n", type=int, default=50)
 
+    node = sub.add_parser("dns", help="DNS 网关管理（转发至 dnsctl）")
+    node.add_argument("rest", nargs=argparse.REMAINDER,
+                      help="dnsctl 参数，如 dns status / dns doctor / dns cert renew")
+
     cert_p = sub.add_parser("cert", help="证书管理")
     cert_sub = cert_p.add_subparsers(dest="action", required=True)
     node = cert_sub.add_parser("issue")
@@ -1032,6 +1058,7 @@ ROUTES = {
     "abuse": cmd_abuse,
     "backup": cmd_backup,
     "log": cmd_log,
+    "dns": cmd_dns,
 }
 
 _SUBROUTES = {
