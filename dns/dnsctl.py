@@ -14,6 +14,7 @@
 #   dnsctl blocklist update [--url] [--enable]   更新广告拦截表（StevenBlack hosts）
 #   dnsctl addr switch <旧地址> <新地址>       切换 DoT/DoH/mTLS 接入地址
 #   dnsctl domain switch <新域名>              切换服务域名（自动重新签发证书）
+#   dnsctl cert renew                          手动重新签发当前证书并重载全部服务
 #   dnsctl guard                               反滥用加固：限制 53/udp 仅内网可达
 #   dnsctl version                             版本信息
 #
@@ -606,6 +607,35 @@ def cmd_domain(args, cfg):
     print(f"\n完成。请将 DNS 记录切换至新域名 {dom}。旧证书保留于 /root/.acme.sh/。")
 
 
+def cmd_cert_renew(cfg):
+    """手动重新签发当前证书（acme.sh --force），签发后自动装载并重载全部服务。"""
+    dot = cfg.get("listen", {}).get("dot", {})
+    cert = dot.get("cert", "")
+    if not cert or not os.path.exists(cert):
+        sys.exit(f"证书文件不存在：{cert}")
+    r = sh(f"openssl x509 -in {cert} -noout -subject")
+    old = r.stdout.split("CN =")[-1].strip() if "=" in r.stdout else ""
+    if not old:
+        sys.exit("无法从现有证书读取域名")
+    print(f"重新签发：{old}（acme.sh webroot，强制模式）")
+    r = sh(f"/root/.acme.sh/acme.sh --issue -d {old} -w /var/www/acme "
+           f"--keylength ec-256 --force --server letsencrypt")
+    tail = "\n".join(r.stdout.strip().splitlines()[-3:])
+    print(tail)
+    if r.returncode != 0:
+        sys.exit("签发失败：检查 80 端口验证入口与域名解析")
+    d = os.path.dirname(cert)
+    key = dot.get("key", os.path.join(d, "key.pem"))
+    r = sh(f"/root/.acme.sh/acme.sh --install-cert -d {old} --ecc "
+           f"--fullchain-file {cert} --key-file {key} "
+           f"--reloadcmd 'systemctl reload mosdns; /opt/nginx-mtls/sbin/nginx "
+           f"-c /etc/nginx-mtls/nginx.conf -s reload; "
+           f"logger -t acme-cert \"{old} manual-renew\"'")
+    print(r.stdout.strip().splitlines()[-1] if r.stdout else "")
+    r = sh(f"openssl x509 -in {cert} -noout -enddate")
+    print(f"新证书有效期：{r.stdout.strip()}")
+
+
 def cmd_guard(args, cfg):
     """反滥用加固：53/udp 仅允许内网网段，显式拒绝其余来源（防范 DNS 反射放大）。"""
     print("▸ 对外 53/udp 监听检查")
@@ -774,6 +804,10 @@ def main():
 
     p = sub.add_parser("guard", help="反滥用加固（防 DNS 反射）")
     p.set_defaults(fn=cmd_guard)
+
+    p = sub.add_parser("cert", help="证书手动管理")
+    p.add_argument("action", choices=["renew"])
+    p.set_defaults(fn=lambda a, c: cmd_cert_renew(c) if a.action == "renew" else None)
 
     p = sub.add_parser("version", help="版本")
     p.set_defaults(fn=lambda a, c: print(f"antipole-dns (dnsctl) v{VERSION}"))
