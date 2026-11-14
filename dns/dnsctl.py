@@ -15,6 +15,7 @@
 #   dnsctl addr switch <旧地址> <新地址>       切换 DoT/DoH/mTLS 接入地址
 #   dnsctl domain switch <新域名>              切换服务域名（自动重新签发证书）
 #   dnsctl cert renew                          手动重新签发当前证书并重载全部服务
+#   dnsctl cert password                       查看 mTLS 客户端证书导入密码
 #   dnsctl guard                               反滥用加固：限制 53/udp 仅内网可达
 #   dnsctl version                             版本信息
 #
@@ -576,64 +577,116 @@ def cmd_addr(args, cfg):
 
 
 def cmd_domain(args, cfg):
-    """domain switch <新域名>：重新签发证书并更新 server_name（新域名 AAAA 须已解析至本服务器）。"""
+    """domain switch <新域名>：追加新域名到 SAN 证书，新旧域名同时有效。
+    要求：新域名 AAAA 已解析至本服务器（80 端口验证入口自动追加该域名）。"""
     dom = args.domain
     dot = cfg.get("listen", {}).get("dot", {})
-    cert = dot.get("cert", "")
-    try:
-        old = subprocess.run(["openssl", "x509", "-in", cert, "-noout", "-subject"],
-                             capture_output=True, text=True).stdout
-        old = old.split("CN =")[-1].strip()
-    except Exception:
-        sys.exit("无法从现有证书读取当前域名")
-    print(f"域名切换：{old} → {dom}")
-    r = sh(f"/root/.acme.sh/acme.sh --issue -d {dom} -w /var/www/acme --keylength ec-256 --server letsencrypt")
-    if r.returncode != 0:
-        print(r.stdout[-500:]); sys.exit("签发失败：请确认新域名 AAAA 记录已解析至本服务器（80 端口验证入口已就绪）")
-    d = f"/etc/antipole-dns/cert/{dom}"
-    os.makedirs(d, exist_ok=True)
-    r = sh(f"/root/.acme.sh/acme.sh --install-cert -d {dom} --ecc "
-           f"--fullchain-file {d}/fullchain.pem --key-file {d}/key.pem "
-           f"--reloadcmd 'systemctl reload mosdns; /opt/nginx-mtls/sbin/nginx -c {NGINX_MTLS_CONF} -s reload; logger -t acme-cert \"{dom} renewed\"'")
+    cert, key = dot.get("cert", ""), dot.get("key", "")
+    old_doms = _cert_domains(cfg)
+    if dom in old_doms:
+        print("该域名已在证书中")
+        return
+    if not old_doms:
+        sys.exit("无法确定现有服务域名（dns.yaml dot.domains 或现有证书）")
+    all_doms = old_doms + [dom]
+    print(f"SAN 证书将覆盖：{' '.join(all_doms)}（旧域名继续有效）")
+    # 80 端口 ACME 验证入口先追加新域名（nginx http 块 server_name）
+    ng = open(NGINX_MTLS_CONF, encoding="utf-8").read()
+    new_ng = ng
+    hit = False
+    for sn in set(re.findall(r"server_name\s+([^;]+);", ng)):
+        names = sn.split()
+        if any(d in names for d in old_doms) and dom not in names:
+            new_ng = new_ng.replace(f"server_name {sn};",
+                                    "server_name " + " ".join(names + [dom]) + ";")
+            hit = True
+    if hit:
+        shutil.copy2(NGINX_MTLS_CONF, NGINX_MTLS_CONF + ".bak-dom")
+        open(NGINX_MTLS_CONF, "w", encoding="utf-8").write(new_ng)
+        r = sh(f"/opt/nginx-mtls/sbin/nginx -t -c {NGINX_MTLS_CONF}")
+        if r.returncode != 0:
+            open(NGINX_MTLS_CONF, "w", encoding="utf-8").write(ng)
+            sys.exit(f"nginx 配置校验失败，已回滚：{r.stderr.strip()}")
+        sh(f"/opt/nginx-mtls/sbin/nginx -c {NGINX_MTLS_CONF} -s reload")
+        print("✓ 80 端口验证入口已追加新域名")
+    if not _issue_san(all_doms):
+        sys.exit("签发失败：确认新域名 AAAA 记录已解析至本服务器")
+    for f in (cert, key):                       # 旧证书文件备份保留
+        if os.path.exists(f):
+            shutil.copy2(f, f + ".bak")
+    r = sh(f"/root/.acme.sh/acme.sh --install-cert -d {old_doms[0]} --ecc "
+           f"--fullchain-file {cert} --key-file {key} "
+           f"--reloadcmd 'systemctl reload mosdns; /opt/nginx-mtls/sbin/nginx "
+           f"-c {NGINX_MTLS_CONF} -s reload; logger -t acme-cert \"domain-add {dom}\"'")
     print(r.stdout.strip().splitlines()[-1] if r.stdout else "")
+    # dns.yaml 记录 SAN 域名集合（后续 renew/cert 操作沿用）
     y = open(args.config, encoding="utf-8").read()
-    open(args.config, "w", encoding="utf-8").write(
-        y.replace("/etc/antipole-dns/cert/us-dns-fullchain.pem", f"{d}/fullchain.pem")
-         .replace("/etc/antipole-dns/cert/us-dns-key.pem", f"{d}/key.pem"))
-    changed = _sub_tree(NGINX_MTLS_CONF, old, dom) + _sub_tree(
-        NGINX_MTLS_CONF, old, dom, globs=["/etc/nginx-mtls/stream.d/*.conf"])
-    print("nginx 引用已替换：" + (", ".join(dict.fromkeys(changed)) or "（无）"))
+    if "    domains:" in y:
+        y = y.replace("    domains:", f"    domains:\n      - {dom}", 1)
+    else:
+        y = y.replace("    cert:", f"    domains:\n      - {dom}\n    cert:", 1)
+    open(args.config, "w", encoding="utf-8").write(y)
     do_apply(load_config(args.config), restart=True, yes=True)
-    print(f"\n完成。请将 DNS 记录切换至新域名 {dom}。旧证书保留于 /root/.acme.sh/。")
+    r = sh(f"openssl x509 -in {cert} -noout -enddate -ext subjectAltName")
+    print(r.stdout.strip())
+    print("\n完成：新旧域名同时有效，均可用作 DoT/DoH 接入（旧客户端配置无需任何变更）。")
+
+
+def _cert_domains(cfg):
+    """当前 SAN 域名集合：dns.yaml dot.domains 优先，缺省取现有证书 CN。"""
+    doms = cfg.get("listen", {}).get("dot", {}).get("domains") or []
+    if not doms:
+        cert = cfg.get("listen", {}).get("dot", {}).get("cert", "")
+        r = sh(f"openssl x509 -in {cert} -noout -subject")
+        cn = r.stdout.split("CN =")[-1].strip() if "=" in r.stdout else ""
+        doms = [cn] if cn else []
+    return [d for d in doms if d]
+
+
+def _issue_san(doms, force=False):
+    """按域名集合签发 SAN 证书（webroot http-01）。返回是否成功。"""
+    f = "--force" if force else ""
+    flags = " ".join(f"-d {d}" for d in doms)
+    r = sh(f"/root/.acme.sh/acme.sh --issue {flags} -w /var/www/acme "
+           f"--keylength ec-256 {f} --server letsencrypt")
+    if r.returncode != 0:
+        print(r.stdout.strip().splitlines()[-1] if r.stdout else "")
+        return False
+    return True
 
 
 def cmd_cert_renew(cfg):
-    """手动重新签发当前证书（acme.sh --force），签发后自动装载并重载全部服务。"""
+    """手动重新签发当前证书（SAN 覆盖全部服务域名），旧证书文件自动备份。"""
+    doms = _cert_domains(cfg)
+    if not doms:
+        sys.exit("无法确定服务域名（dns.yaml dot.domains 或现有证书）")
+    print(f"重新签发，覆盖域名：{' '.join(doms)}")
+    if not _issue_san(doms, force=True):
+        sys.exit("签发失败：检查 80 端口验证入口与各域名解析")
     dot = cfg.get("listen", {}).get("dot", {})
-    cert = dot.get("cert", "")
-    if not cert or not os.path.exists(cert):
-        sys.exit(f"证书文件不存在：{cert}")
-    r = sh(f"openssl x509 -in {cert} -noout -subject")
-    old = r.stdout.split("CN =")[-1].strip() if "=" in r.stdout else ""
-    if not old:
-        sys.exit("无法从现有证书读取域名")
-    print(f"重新签发：{old}（acme.sh webroot，强制模式）")
-    r = sh(f"/root/.acme.sh/acme.sh --issue -d {old} -w /var/www/acme "
-           f"--keylength ec-256 --force --server letsencrypt")
-    tail = "\n".join(r.stdout.strip().splitlines()[-3:])
-    print(tail)
-    if r.returncode != 0:
-        sys.exit("签发失败：检查 80 端口验证入口与域名解析")
+    cert, key = dot.get("cert", ""), dot.get("key", "")
+    for f in (cert, key):                       # 旧证书文件备份保留
+        if os.path.exists(f):
+            shutil.copy2(f, f + ".bak")
     d = os.path.dirname(cert)
-    key = dot.get("key", os.path.join(d, "key.pem"))
-    r = sh(f"/root/.acme.sh/acme.sh --install-cert -d {old} --ecc "
+    r = sh(f"/root/.acme.sh/acme.sh --install-cert -d {doms[0]} --ecc "
            f"--fullchain-file {cert} --key-file {key} "
            f"--reloadcmd 'systemctl reload mosdns; /opt/nginx-mtls/sbin/nginx "
            f"-c /etc/nginx-mtls/nginx.conf -s reload; "
-           f"logger -t acme-cert \"{old} manual-renew\"'")
+           f"logger -t acme-cert \"manual-renew {doms[0]}\"'")
     print(r.stdout.strip().splitlines()[-1] if r.stdout else "")
-    r = sh(f"openssl x509 -in {cert} -noout -enddate")
-    print(f"新证书有效期：{r.stdout.strip()}")
+    r = sh(f"openssl x509 -in {cert} -noout -enddate -ext subjectAltName")
+    print(r.stdout.strip())
+
+
+def cmd_cert_password(cfg):
+    """显示 mTLS 客户端证书（client.p12）的导入密码。"""
+    p = "/etc/mosdns/client.p12.pass"
+    if not os.path.exists(p):
+        sys.exit("密码文件不存在：/etc/mosdns/client.p12.pass")
+    pwd = open(p).read().strip()
+    print(f"mTLS 客户端证书密码：{pwd}")
+    print("证书文件：/etc/mosdns/client.p12（连同 client.crt / client.key 提供给设备导入）")
 
 
 def cmd_guard(args, cfg):
@@ -806,8 +859,9 @@ def main():
     p.set_defaults(fn=cmd_guard)
 
     p = sub.add_parser("cert", help="证书手动管理")
-    p.add_argument("action", choices=["renew"])
-    p.set_defaults(fn=lambda a, c: cmd_cert_renew(c) if a.action == "renew" else None)
+    p.add_argument("action", choices=["renew", "password"])
+    p.set_defaults(fn=lambda a, c: cmd_cert_renew(c) if a.action == "renew"
+                   else cmd_cert_password(c))
 
     p = sub.add_parser("version", help="版本")
     p.set_defaults(fn=lambda a, c: print(f"antipole-dns (dnsctl) v{VERSION}"))

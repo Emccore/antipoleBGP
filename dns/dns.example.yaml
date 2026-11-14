@@ -34,6 +34,9 @@ listen:
   local: "127.0.0.1:53"            # 本机 53
   doh_inner: "127.0.0.1:8080"      # 内部 DoH（nginx-mtls 反代对外）
   dot:
+    domains:                         # SAN 证书覆盖的域名集合（domain switch 自动追加）
+      - us-dns.2008828.xyz
+      - cloud.10242048.shop
     cert: /etc/letsencrypt/live/us-dns.2008828.xyz/fullchain.pem
     key: /etc/letsencrypt/live/us-dns.2008828.xyz/privkey.pem
     listens:                        # 对外 DoT 及备用端口，每条格式 [地址]:端口
