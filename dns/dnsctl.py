@@ -87,14 +87,9 @@ def render_mosdns(cfg):
     A(f"        - {_q(cfg.get('geosite_cn', ''))}")
     A("")
     if bl.get("enabled"):
-        A("  # 广告与跟踪域名拦截：命中返回空记录")
-        A("  - tag: black_hole")
-        A("    type: black_hole")
-        A("    args:")
-        A("      ipv4: 0.0.0.0")
-        A("      ipv6: ::")
-        A("  - tag: blocklist")
-        A("    type: domain_set")
+        A("  # 广告与跟踪域名拦截：hosts 插件命中返回空地址（0.0.0.0），未命中继续")
+        A("  - tag: blocklist_hosts")
+        A("    type: hosts")
         A("    args:")
         A("      files:")
         A(f"        - {_q(bl.get('file', ''))}")
@@ -126,14 +121,15 @@ def render_mosdns(cfg):
         if u.startswith("tls://"):
             A("          enable_pipeline: true")
     A("")
-    A("  # 解析主流程：缓存查询 → 拦截表 → 国别分流（国内容明文，其余走加密出口）")
+    A("  # 解析主流程：拦截（命中即返回）→ 缓存 → 国别分流（国内容明文，其余走加密出口）")
     A("  - tag: main_sequence")
     A("    type: sequence")
     A("    args:")
-    A("      - exec: $cache")
     if bl.get("enabled"):
-        A('      - matches: "qname $blocklist"')
-        A("        exec: $black_hole")
+        A("      - exec: $blocklist_hosts")
+        A("      - matches: has_resp")
+        A("        exec: accept")
+    A("      - exec: $cache")
     A('      - matches: "qname $geosite_cn"')
     A("        exec: $forward_local")
     A("      - exec: $forward_remote")
@@ -742,36 +738,33 @@ def _fetch(url):
         return r.read().decode("utf-8", errors="replace")
 
 
-def _to_mosdns_domainset(text):
-    """将 v2ray/hosts 格式域名列表转换为 mosdns domain_set 文本格式。"""
+def _to_hosts_blocklist(text):
+    """hosts/域名列表 → mosdns hosts 插件文件（格式：域名 0.0.0.0，IP 在行尾）。"""
+    skip = {"localhost", "localhost.localdomain", "local", "broadcasthost",
+            "ip6-localhost", "ip6-loopback", "0.0.0.0"}
     lines = []
     for raw in text.splitlines():
         s = raw.strip()
         if not s or s.startswith(("#", "!")):
             continue
-        if s.startswith("+."):
-            lines.append("domain:" + s[2:])
-        elif s.startswith("."):
-            lines.append("domain:" + s[1:])
-        elif s.startswith("full:"):
-            lines.append(s)
-        elif " " in s or "\t" in s:                  # hosts 格式：0.0.0.0 域名
-            parts = s.split()
-            if len(parts) == 2 and parts[0].replace(".", "").isdigit():
-                d = parts[1]
-                if d:
-                    lines.append("full:" + d)
+        parts = s.split()
+        if len(parts) >= 2 and parts[0].replace(".", "").isdigit():
+            d = parts[1]
+        elif s.startswith(("+.", ".")):
+            d = s.lstrip("+.")
         elif "/" in s or "=" in s:
-            continue                                  # 其他格式跳过
+            continue
         else:
-            lines.append("full:" + s)
+            d = s
+        if d and "." in d and d not in skip and not d.replace(".", "").isdigit():
+            lines.append(f"{d} 0.0.0.0")
     return "\n".join(dict.fromkeys(lines)) + "\n"
 
 
 def _update_table(url, dest, label, convert=True):
     print(f"下载 {label}：{url}")
     text = _fetch(url)
-    data = _to_mosdns_domainset(text) if convert else text
+    data = _to_hosts_blocklist(text) if convert else text
     n = data.count("\n")
     if os.path.exists(dest):
         shutil.copy2(dest, dest + ".bak")

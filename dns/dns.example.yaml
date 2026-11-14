@@ -24,9 +24,9 @@ upstreams:
 # 国内域名分流表（mosdns domain_set 文本，dnsctl geosite update 可更新）
 geosite_cn: /etc/antipole-dns/geosite_cn.txt
 
-# 广告与跟踪域名拦截（默认关闭）：命中返回 0.0.0.0 / ::
+# 广告与跟踪域名拦截（默认开启）：命中返回 0.0.0.0 / ::
 blocklist:
-  enabled: false
+  enabled: true
   file: /etc/antipole-dns/blocklist.txt
 
 # 监听
